@@ -6,6 +6,9 @@ using PowerBI.Data;
 using System.Net.Http.Headers;
 using System.Linq;
 using System.Collections.Generic;
+using Newtonsoft.Json;
+using System.Text;
+using Microsoft.EntityFrameworkCore;
 
 namespace PowerBI.Services
 {
@@ -30,7 +33,7 @@ namespace PowerBI.Services
             return new PowerBIClient(new Uri("https://api.powerbi.com/"), credentials);
         }
 
-        // 🏢 Get or Create Workspace
+        // Get or Create Workspace
         public async Task<Microsoft.PowerBI.Api.Models.Group> GetOrCreateWorkspace(string name)
         {
             try 
@@ -51,8 +54,8 @@ namespace PowerBI.Services
                 var newGroup = await client.Groups.CreateGroupAsync(new GroupCreationRequest { Name = name });
                 Console.WriteLine($"[SERVICE] New workspace created: {newGroup.Id}");
 
-                // 🚀 AUTO-ASSIGN TO CAPACITY
-                var capacityId = _auth.GetCapacityId(); // I'll add this helper to Auth service
+                // AUTO-ASSIGN TO CAPACITY
+                var capacityId = _auth.GetCapacityId(); 
                 if (!string.IsNullOrEmpty(capacityId))
                 {
                     Console.WriteLine($"[SERVICE] Auto-assigning to capacity: {capacityId}");
@@ -64,8 +67,7 @@ namespace PowerBI.Services
                     }
                 }
 
-                // 🔑 CRITICAL: Add the human admin user to the workspace
-                // Since SP is the creator, the human user won't see it otherwise.
+
                 var adminEmail = _auth.GetAdminEmail();
                 if (!string.IsNullOrEmpty(adminEmail))
                 {
@@ -94,7 +96,7 @@ namespace PowerBI.Services
             }
         }
 
-        // 🔄 Sync Workspaces with Local DB
+     
         public async Task SyncWorkspaces(int userId, AppDbContext db)
         {
             try 
@@ -106,11 +108,10 @@ namespace PowerBI.Services
 
                 var localWorkspaces = db.Workspaces.Where(w => w.UserId == userId).ToList();
 
-                // 1. Add/Update from Power BI to Local DB
+
                 var adminEmail = _auth.GetAdminEmail();
                 foreach (var pbiWs in pbiWorkspaces)
                 {
-                    // Attempt to ensure AdminEmail is always an admin (Visibility Fix)
                     if (!string.IsNullOrEmpty(adminEmail))
                     {
                         try 
@@ -122,7 +123,7 @@ namespace PowerBI.Services
                                 PrincipalType = "User" 
                             });
                         }
-                        catch { /* Ignore if already admin or error */ }
+                        catch { }
                     }
 
                     var existing = localWorkspaces.FirstOrDefault(w => w.PowerBIWorkspaceId == pbiWs.Id.ToString());
@@ -143,7 +144,6 @@ namespace PowerBI.Services
                     }
                 }
 
-                // 2. Remove from Local DB if deleted in Power BI
                 foreach (var localWs in localWorkspaces)
                 {
                     if (!pbiWorkspaces.Any(pbi => pbi.Id.ToString() == localWs.PowerBIWorkspaceId))
@@ -167,20 +167,15 @@ namespace PowerBI.Services
             }
         }
 
-        // ✏️ Rename Workspace in Power BI
+
         public async Task RenameWorkspace(Guid workspaceId, string newName)
         {
             Console.WriteLine($"[SERVICE] Renaming workspace {workspaceId} to '{newName}'");
             var client = await GetClient();
-            // Power BI API doesn't have a direct 'Rename' method in the SDK for Groups, 
-            // but you can update group properties if it's a modern workspace.
-            // For simplicity in this demo, we assume modern workspaces.
-            // Note: UpdateGroup is often restricted for Service Principals depending on tenant settings.
-            // We use the REST API via the client.
             await client.Groups.UpdateGroupAsync(workspaceId, new UpdateGroupRequest { Name = newName });
         }
 
-        // 🗑️ Delete Workspace from Power BI
+
         public async Task DeleteWorkspace(Guid workspaceId)
         {
             Console.WriteLine($"[SERVICE] Deleting workspace {workspaceId}");
@@ -188,30 +183,162 @@ namespace PowerBI.Services
             await client.Groups.DeleteGroupAsync(workspaceId);
         }
 
-        // 🔄 Sync Reports within a Workspace
+
+
+
+        public async Task SyncFolders(int localWorkspaceId, Guid pbiWorkspaceId, AppDbContext db)
+        {
+            try
+            {
+                Console.WriteLine($"[SERVICE] Syncing folders for Workspace: {pbiWorkspaceId}");
+                var token = await _auth.GetFabricToken();
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+                var url = $"https://api.fabric.microsoft.com/v1/workspaces/{pbiWorkspaceId}/folders";
+                var response = await client.GetAsync(url);
+                if (!response.IsSuccessStatusCode) return;
+
+                var rawJson = await response.Content.ReadAsStringAsync();
+                var root = JsonConvert.DeserializeObject<dynamic>(rawJson);
+                var folders = root?.value;
+
+                var localFolders = db.Folders.Where(f => f.WorkspaceId == localWorkspaceId).ToList();
+
+                if (folders != null)
+                {
+                    foreach (var f in folders)
+                    {
+                        string? fId = f.id?.ToString();
+                        string? fName = f.displayName?.ToString();
+                        if (string.IsNullOrEmpty(fId) || string.IsNullOrEmpty(fName)) continue;
+                        
+                        Console.WriteLine($"[SERVICE] Folder Sync: Found '{fName}' (Fabric ID: {fId})");
+
+                        var existing = localFolders.FirstOrDefault(lf => lf.FabricFolderId == fId);
+                        if (existing == null)
+                        {
+                            db.Folders.Add(new Folder
+                            {
+                                Name = fName,
+                                FabricFolderId = fId,
+                                WorkspaceId = localWorkspaceId
+                            });
+                        }
+                        else if (existing.Name != fName)
+                        {
+                            existing.Name = fName;
+                        }
+                    }
+                }
+
+                // Cleanup deleted folders
+                foreach (var lf in localFolders)
+                {
+                    bool stillExists = false;
+                    if (folders != null)
+                    {
+                        foreach (var f in folders)
+                        {
+                            if (f.id?.ToString() == lf.FabricFolderId) { stillExists = true; break; }
+                        }
+                    }
+                    if (!stillExists) db.Folders.Remove(lf);
+                }
+
+                await db.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SERVICE] SyncFolders Error: {ex.Message}");
+            }
+        }
+
         public async Task SyncReports(int localWorkspaceId, Guid pbiWorkspaceId, AppDbContext db)
         {
             try 
             {
+                // 1. Sync Folders First
+                await SyncFolders(localWorkspaceId, pbiWorkspaceId, db);
+
                 Console.WriteLine($"[SERVICE] Syncing reports for Workspace: {pbiWorkspaceId}");
                 var client = await GetClient();
                 var pbiReports = (await client.Reports.GetReportsInGroupAsync(pbiWorkspaceId)).Value;
 
-                var localReports = db.Reports.Where(r => r.WorkspaceId == localWorkspaceId).ToList();
+                // 2. Fetch item metadata from Fabric to get folder associations
+                var fabricToken = await _auth.GetFabricToken();
+                using var httpClient = new HttpClient();
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", fabricToken);
+                
+                // Explicitly set recursive=true to ensure we see items inside folders
+                var itemsUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{pbiWorkspaceId}/items?recursive=true";
+                var itemsResponse = await httpClient.GetAsync(itemsUrl);
+                var itemsJson = await itemsResponse.Content.ReadAsStringAsync();
+                
+                if (!itemsResponse.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"[SYNC] ERROR: Fabric Items API failed with {itemsResponse.StatusCode}. Content: {itemsJson}");
+                }
 
-                // 1. Add/Update from Power BI to Local DB
+                var itemsRoot = JsonConvert.DeserializeObject<dynamic>(itemsJson);
+                var fabricItems = itemsRoot?.value;
+
+                if (fabricItems != null)
+                {
+                    var itemList = (Newtonsoft.Json.Linq.JArray)fabricItems;
+                    Console.WriteLine($"[SYNC] Fabric API returned {itemList.Count} items.");
+                    foreach (var item in fabricItems)
+                    {
+                        Console.WriteLine($"[SYNC] Found Fabric Item: {item.displayName} (Type: {item.type}, Parent: {item.parentFolderId ?? "Root"})");
+                    }
+                }
+                else if (itemsResponse.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("[SYNC] WARNING: Fabric API returned success but 'value' was null or empty.");
+                }
+
+                var localReports = db.Reports.Where(r => r.WorkspaceId == localWorkspaceId).ToList();
+                var localFolders = db.Folders.Where(f => f.WorkspaceId == localWorkspaceId).ToList();
+
                 foreach (var pbiRep in pbiReports)
                 {
+                    // Find parent folder from Fabric Items
+                    string? parentFolderId = null;
+                    if (fabricItems != null)
+                    {
+                        foreach (var item in fabricItems)
+                        {
+                            if (item.id?.ToString().Equals(pbiRep.Id.ToString(), StringComparison.OrdinalIgnoreCase) == true)
+                            {
+                                parentFolderId = item.parentFolderId?.ToString();
+                                break;
+                            }
+                        }
+                    }
+
+                    int? localFolderId = null;
+                    if (!string.IsNullOrEmpty(parentFolderId))
+                    {
+                        var folderMatch = localFolders.FirstOrDefault(f => f.FabricFolderId == parentFolderId);
+                        localFolderId = folderMatch?.Id;
+                        Console.WriteLine($"[SYNC] Report '{pbiRep.Name}' matched to Folder: '{folderMatch?.Name ?? "Unknown"}' (Fabric ID: {parentFolderId})");
+                    }
+                    else 
+                    {
+                        Console.WriteLine($"[SYNC] Report '{pbiRep.Name}' has NO parent folder (Root).");
+                    }
+
                     var existing = localReports.FirstOrDefault(r => r.PowerBIReportId == pbiRep.Id.ToString());
                     if (existing == null)
                     {
-                        Console.WriteLine($"[SERVICE] Adding new PBI report to DB: {pbiRep.Name} (Type: {pbiRep.ReportType})");
+                        Console.WriteLine($"[SERVICE] Adding new PBI report to DB: {pbiRep.Name} (Folder: {parentFolderId})");
                         db.Reports.Add(new PowerBI.Models.Report
                         {
                             Name = pbiRep.Name,
                             PowerBIReportId = pbiRep.Id.ToString(),
                             PowerBIDatasetId = pbiRep.DatasetId,
                             WorkspaceId = localWorkspaceId,
+                            FolderId = localFolderId,
                             ReportType = pbiRep.ReportType == "PaginatedReport" ? "RDL" : "PowerBI"
                         });
                     }
@@ -220,10 +347,16 @@ namespace PowerBI.Services
                         if (existing.Name != pbiRep.Name) existing.Name = pbiRep.Name;
                         var correctType = pbiRep.ReportType == "PaginatedReport" ? "RDL" : "PowerBI";
                         if (existing.ReportType != correctType) existing.ReportType = correctType;
+                        // Smart Sync: Only overwrite local FolderId if the API gives us a non-null folder,
+                        // OR if we don't already have one locally. This prevents API lag from 
+                        // moving items back to the Root accidentally.
+                        if (localFolderId != null || existing.FolderId == null)
+                        {
+                            existing.FolderId = localFolderId;
+                        }
                     }
                 }
 
-                // 2. Remove from Local DB if deleted in Power BI
                 foreach (var localRep in localReports)
                 {
                     if (!pbiReports.Any(pbi => pbi.Id.ToString() == localRep.PowerBIReportId))
@@ -242,47 +375,93 @@ namespace PowerBI.Services
             }
         }
 
-        public async Task<Import> UploadReport(Guid workspaceId, string name, Stream stream)
+        public async Task<Import> UploadReport(int localWorkspaceId, Guid pbiWorkspaceId, string name, Stream stream, AppDbContext db, string? folderName = null)
         {
             try 
             {
-                Console.WriteLine($"[SERVICE] Importing {name} to Workspace {workspaceId}");
+                Console.WriteLine($"[SERVICE] Importing {name} to Workspace {pbiWorkspaceId}");
                 var client = await GetClient();
+
+                if (name.EndsWith(".pbit", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new Exception("Power BI Templates (.pbit) are not supported for direct upload. Please save your file as a .pbix and try again.");
+                }
 
                 var isRdl = name.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase);
                 var datasetName = isRdl ? name : Path.GetFileNameWithoutExtension(name);
+                var targetFolder = string.IsNullOrEmpty(folderName) ? "Automated Reports" : folderName;
 
                 Console.WriteLine($"[SERVICE] Stream length: {stream.Length} bytes");
 
                 if (stream.Length == 0)
                     throw new Exception("The uploaded file is empty.");
 
-                // For RDL files via Service Principal, 'Abort' is the safest mode.
-                // IMPORTANT: RDL files often REQUIRE the .rdl extension in the display name to be recognized correctly.
                 var conflictMode = isRdl ? ImportConflictHandlerMode.Abort : ImportConflictHandlerMode.CreateOrOverwrite;
-                var finalDisplayName = datasetName; // Keep the name as-is (including .rdl for Paginated)
+                var finalDisplayName = datasetName;
 
                 Console.WriteLine($"[SERVICE] Uploading {name} as {finalDisplayName} (Mode: {conflictMode})");
 
-                var import = await client.Imports.PostImportWithFileAsync(
-                    workspaceId,
-                    stream,
-                    datasetDisplayName: finalDisplayName,
-                    nameConflict: conflictMode);
-
-                return import;
-            }
-            catch (HttpOperationException ex)
-            {
-                Console.WriteLine($"[SERVICE] Power BI API Error during Upload: {ex.Response.Content}");
-                var details = ex.Response.Content;
-                
-                if (details.Contains("ImportUnsupportedOptionError"))
+                int? folderId = null;
+                try 
                 {
-                    throw new Exception("Power BI Error: 'ImportUnsupportedOptionError'. This usually means the workspace is NOT on a Fabric/Premium Capacity. Please ensure the workspace is assigned to your Fabric Trial capacity in the Power BI Portal.");
+                    folderId = await GetOrCreateFolder(localWorkspaceId, pbiWorkspaceId, targetFolder, db);
+                    Console.WriteLine($"[SERVICE] Target Folder ID: {folderId}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[SERVICE] Folder system not ready or unsupported: {ex.Message}. Falling back to root upload.");
                 }
 
-                throw new Exception($"Power BI Upload Error: {ex.Response.ReasonPhrase}. Details: {details}");
+                Import import;
+                
+                // Step 1: Upload to Root
+                Console.WriteLine("[SERVICE] Uploading to workspace root...");
+                import = await client.Imports.PostImportWithFileAsync(
+                    pbiWorkspaceId,
+                    stream,
+                    datasetDisplayName: finalDisplayName,
+                    nameConflict: conflictMode
+                );
+
+                // Step 2: Poll for completion
+                Console.WriteLine($"[SERVICE] Import '{import.Id}' started. Waiting for completion...");
+                int attempts = 0;
+                while (import.ImportState != "Succeeded" && import.ImportState != "Failed" && attempts < 15)
+                {
+                    await Task.Delay(3000);
+                    import = await client.Imports.GetImportInGroupAsync(pbiWorkspaceId, import.Id);
+                    Console.WriteLine($"[SERVICE] Import Status: {import.ImportState}...");
+                    attempts++;
+                }
+
+                if (import.ImportState == "Failed")
+                {
+                    Console.WriteLine($"[SERVICE] ERROR: Power BI Import failed. State: {import.ImportState}");
+                    throw new Exception("Power BI Import failed. This can happen if the file is corrupted or uses unsupported features.");
+                }
+
+                // Step 3: Move to Folder if discovered
+                if (folderId.HasValue && import.Reports != null && import.Reports.Any())
+                {
+                    var reportId = import.Reports.First().Id;
+                    try 
+                    {
+                        var folder = await db.Folders.FindAsync(folderId.Value);
+                        if (folder != null && !string.IsNullOrEmpty(folder.FabricFolderId))
+                        {
+                            Console.WriteLine($"[SERVICE] Moving Report {reportId} to Fabric Folder {folder.FabricFolderId}...");
+                            await MoveItemToFolder(pbiWorkspaceId, reportId, Guid.Parse(folder.FabricFolderId));
+                            Console.WriteLine("[SERVICE] SUCCESS: Report moved to folder.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[SERVICE] Warning: Could not move report to folder: {ex.Message}");
+                    }
+                }
+
+                return import;
+                // --- FOLDER LOGIC END ---
             }
             catch (Exception ex)
             {
@@ -290,13 +469,20 @@ namespace PowerBI.Services
             }
         }
 
-        // 📤 Export PDF to Stream
-        public async Task<Stream> ExportReportAsStream(Guid workspaceId, Guid reportId)
+        public async Task<Stream> ExportReportAsStream(Guid workspaceId, Guid reportId, List<ExportFilter>? filters = null)
         {
-            Console.WriteLine($"[SERVICE] Exporting Report {reportId} to PDF...");
+            Console.WriteLine($"[SERVICE] Exporting Report {reportId} to PDF (Filters: {filters?.Count ?? 0})...");
             var client = await GetClient();
 
-            var exportRequest = new ExportReportRequest { Format = FileFormat.PDF };
+            var exportRequest = new ExportReportRequest 
+            { 
+                Format = FileFormat.PDF,
+                PowerBIReportConfiguration = new Microsoft.PowerBI.Api.Models.PowerBIReportExportConfiguration
+                {
+                    ReportLevelFilters = filters
+                }
+            };
+            
             var export = await client.Reports.ExportToFileInGroupAsync(workspaceId, reportId, exportRequest);
 
             Export status;
@@ -344,12 +530,9 @@ namespace PowerBI.Services
             if (workspace == null || string.IsNullOrEmpty(workspace.PowerBIWorkspaceId))
                 throw new Exception("Workspace not found or not synced.");
 
-            Console.WriteLine($"\n[SCHEMA-DISCOVERY] ==============================");
             Console.WriteLine($"[SCHEMA-DISCOVERY] MODE: {report.ReportType}");
             Console.WriteLine($"[SCHEMA-DISCOVERY] Report Name: {report.Name}");
-            Console.WriteLine($"[SCHEMA-DISCOVERY] ==============================");
 
-            // 1. Clear stale DB data
             var existing = db.ReportFilters.Where(f => f.ReportId == reportId).ToList();
             Console.WriteLine($"[SCHEMA-DISCOVERY] Purging {existing.Count} stale records for reportId={reportId}");
             db.ReportFilters.RemoveRange(existing);
@@ -359,8 +542,6 @@ namespace PowerBI.Services
 
             if (report.ReportType == "RDL")
             {
-                // DISCOVERY FOR PAGINATED REPORTS (RDL)
-                // First try the API, if it fails, fallback to parsing the local XML file
                 try
                 {
                     Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: Attempting API discovery...");
@@ -398,28 +579,30 @@ namespace PowerBI.Services
                     else
                     {
                         Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: API returned {response.StatusCode}. Falling back to Local XML Parsing...");
-                        // FALLBACK: Parse the local .rdl file
                         var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", $"{report.Name}.rdl");
                         if (File.Exists(filePath))
                         {
                             var xml = System.Xml.Linq.XDocument.Load(filePath);
                             var ns = xml.Root?.GetDefaultNamespace();
-                            var rdlParams = xml.Descendants(ns + "ReportParameter");
-
-                            foreach (var p in rdlParams)
+                            if (ns != null)
                             {
-                                string? paramName = p.Attribute("Name")?.Value;
-                                if (string.IsNullOrEmpty(paramName)) continue;
+                                var rdlParams = xml.Descendants(ns + "ReportParameter");
 
-                                db.ReportFilters.Add(new ReportFilter
+                                foreach (var p in rdlParams)
                                 {
-                                    ReportId = reportId,
-                                    TableName = "RDL_PARAMETER",
-                                    ColumnName = paramName,
-                                    DisplayName = paramName,
-                                    IsActive = true
-                                });
-                                count++;
+                                    string? paramName = p.Attribute("Name")?.Value;
+                                    if (string.IsNullOrEmpty(paramName)) continue;
+
+                                    db.ReportFilters.Add(new PowerBI.Models.ReportFilter
+                                    {
+                                        ReportId = reportId,
+                                        TableName = "RDL_PARAMETER",
+                                        ColumnName = paramName,
+                                        DisplayName = paramName,
+                                        IsActive = true
+                                    });
+                                    count++;
+                                }
                             }
                             Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: Local parsing found {count} parameters.");
                         }
@@ -433,7 +616,6 @@ namespace PowerBI.Services
             }
             else
             {
-                // DISCOVERY FOR POWER BI REPORTS - Use Datasets Tables API
                 if (!datasetId.HasValue) throw new Exception("Dataset ID is missing for Power BI report.");
 
                 string rawJson;
@@ -510,7 +692,6 @@ namespace PowerBI.Services
 
             if (tableName == "RDL_PARAMETER")
             {
-                // Logic for Paginated Report Parameters
                 if (!reportId.HasValue || !workspaceId.HasValue) throw new Exception("Report/Workspace ID required for RDL values.");
                 
                 try
@@ -541,8 +722,6 @@ namespace PowerBI.Services
                 }
                 catch { return new List<string>(); }
             }
-
-            // Standard DAX Logic for Power BI Reports
             if (!datasetId.HasValue) throw new Exception("Dataset ID required for Power BI values.");
 
             var daxQuery = $"EVALUATE DISTINCT('{tableName}'[{columnName}])";
@@ -558,31 +737,37 @@ namespace PowerBI.Services
                 var request = new DatasetExecuteQueriesRequest(new List<DatasetExecuteQueriesQuery> { new DatasetExecuteQueriesQuery(daxQuery) });
                 var response = await client.Datasets.ExecuteQueriesAsync(datasetId.ToString(), request);
 
-                if (response?.Results != null && response.Results.Count > 0)
+                if (response?.Results != null && response.Results.Count > 0 && response.Results[0].Tables != null && response.Results[0].Tables!.Count > 0)
                 {
-                    var table = response.Results[0].Tables[0];
-                    foreach (dynamic row in table.Rows)
+                    var firstResult = response.Results[0];
+                    if (firstResult.Tables != null && firstResult.Tables.Count > 0)
                     {
-                        var rowStr = row?.ToString();
-                        if (string.IsNullOrEmpty(rowStr)) continue;
-
-                        var dict = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(rowStr);
-                        if (dict != null && dict.Values.Count > 0)
+                        var table = firstResult.Tables[0];
+                        if (table.Rows != null)
                         {
-                            foreach (var valObj in dict.Values)
+                            foreach (dynamic row in table.Rows)
                             {
-                                string? valStr = valObj?.ToString();
-                                if (!string.IsNullOrEmpty(valStr))
+                                var rowStr = row?.ToString();
+                                if (string.IsNullOrEmpty(rowStr)) continue;
+
+                                var dict = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, object>>(rowStr);
+                                if (dict != null && dict.Values.Count > 0)
                                 {
-                                    results.Add(valStr);
-                                    break; 
+                                    foreach (var valObj in dict.Values)
+                                    {
+                                        string? valStr = valObj?.ToString();
+                                        if (!string.IsNullOrEmpty(valStr))
+                                        {
+                                            results.Add(valStr);
+                                            break; 
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 Console.WriteLine($"[DYNAMIC] RESULT: {results.Count} values found.");
-                Console.WriteLine("--------------------------------------------------");
             }
             catch (Exception ex) 
             { 
@@ -596,5 +781,141 @@ namespace PowerBI.Services
         }
 
 
+        public async Task<int> GetOrCreateFolder(int localWorkspaceId, Guid pbiWorkspaceId, string folderName, AppDbContext db)
+        {
+            Console.WriteLine($"[SERVICE] GetOrCreateFolder: Looking for '{folderName}' in workspace {pbiWorkspaceId}");
+            
+            // 1. Check local DB first
+            var localFolder = await db.Folders.FirstOrDefaultAsync(f => f.WorkspaceId == localWorkspaceId && f.Name == folderName);
+            if (localFolder != null) return localFolder.Id;
+
+            var token = await _auth.GetFabricToken();
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            // 2. Check if folder exists using Fabric API
+            string? fabricFolderId = null;
+            var listUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{pbiWorkspaceId}/folders";
+            var listResponse = await client.GetAsync(listUrl);
+            if (listResponse.IsSuccessStatusCode)
+            {
+                var content = await listResponse.Content.ReadAsStringAsync();
+                var folders = JsonConvert.DeserializeObject<dynamic>(content);
+                if (folders != null && folders.value != null)
+                {
+                    foreach (var folder in folders.value)
+                    {
+                        if (folder?.displayName?.ToString() == folderName) 
+                        {
+                            fabricFolderId = folder.id.ToString();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 3. Create if not found using Fabric API
+            if (string.IsNullOrEmpty(fabricFolderId))
+            {
+                Console.WriteLine($"[SERVICE] Folder '{folderName}' not found in Fabric. Creating...");
+                var createUrl = $"https://api.fabric.microsoft.com/v1/workspaces/{pbiWorkspaceId}/folders";
+                var body = JsonConvert.SerializeObject(new { displayName = folderName });
+                var createResponse = await client.PostAsync(createUrl, new StringContent(body, Encoding.UTF8, "application/json"));
+                
+                var resultJson = await createResponse.Content.ReadAsStringAsync();
+                if (createResponse.IsSuccessStatusCode)
+                {
+                    var folder = JsonConvert.DeserializeObject<dynamic>(resultJson);
+                    fabricFolderId = folder?.id?.ToString();
+                }
+                else
+                {
+                     throw new Exception($"Fabric Folder API failed: {resultJson}");
+                }
+            }
+
+            // 4. Save/Sync to local DB and return ID
+            if (!string.IsNullOrEmpty(fabricFolderId))
+            {
+                var folder = new Folder
+                {
+                    Name = folderName,
+                    FabricFolderId = fabricFolderId,
+                    WorkspaceId = localWorkspaceId
+                };
+                db.Folders.Add(folder);
+                await db.SaveChangesAsync();
+                return folder.Id;
+            }
+
+            return 0;
+        }
+
+        private async Task MoveItemToFolder(Guid workspaceId, Guid itemId, Guid targetFolderId)
+        {
+            var token = await _auth.GetFabricToken();
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            var url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{itemId}/move";
+            var body = JsonConvert.SerializeObject(new { targetFolderId = targetFolderId.ToString() });
+
+            var response = await client.PostAsync(url, new StringContent(body, Encoding.UTF8, "application/json"));
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                throw new Exception($"Fabric Move API failed with status {(int)response.StatusCode}: {error}");
+            }
+        }
+        public async Task<List<dynamic>> GetDatasetTablesAndColumns(Guid datasetId)
+        {
+            Console.WriteLine($"[SERVICE] Fetching schema for Dataset: {datasetId}");
+            var token = await _auth.GetAccessToken();
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var url = $"https://api.powerbi.com/v1.0/myorg/datasets/{datasetId}/tables";
+
+            var response = await httpClient.GetAsync(url);
+            var rawJson = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode) 
+            {
+                Console.WriteLine($"[SERVICE] API FAIL: {response.StatusCode} - {rawJson}");
+                if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    throw new Exception("Access Denied (403). This usually means: 1. The Workspace is NOT on a Premium/Fabric capacity. 2. 'Enhanced Metadata Scan' is disabled for Service Principals in the Admin Portal. 3. The SP is not a Member/Admin of the workspace.");
+                }
+                throw new Exception($"Power BI API returned {response.StatusCode}: {rawJson}");
+            }
+
+            var root = Newtonsoft.Json.Linq.JObject.Parse(rawJson);
+            var tables = root["value"] as Newtonsoft.Json.Linq.JArray;
+
+            var result = new List<dynamic>();
+            if (tables != null)
+            {
+                foreach (var tbl in tables)
+                {
+                    string? tableName = tbl["name"]?.ToString();
+                    if (string.IsNullOrEmpty(tableName)) continue;
+
+                    var cols = tbl["columns"] as Newtonsoft.Json.Linq.JArray;
+                    if (cols != null)
+                    {
+                        foreach (var col in cols)
+                        {
+                            string? colName = col["name"]?.ToString();
+                            if (!string.IsNullOrEmpty(colName))
+                            {
+                                result.Add(new { table = tableName, column = colName });
+                            }
+                        }
+                    }
+                }
+            }
+            Console.WriteLine($"[SERVICE] Discovery complete. Found {result.Count} columns across all tables.");
+            return result;
+        }
     }
 }

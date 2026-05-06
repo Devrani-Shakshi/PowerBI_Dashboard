@@ -4,315 +4,463 @@
     ViewData["Title"] = "Report Preview";
 }
 
+<style>
+    .filter-sidebar {
+        width: 300px;
+        background: rgba(255, 255, 255, 0.9);
+        backdrop-filter: blur(10px);
+        border-left: 1px solid rgba(0, 0, 0, 0.05);
+        height: 850px;
+        transition: all 0.3s ease;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .filter-header {
+        padding: 1.5rem;
+        border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+        background: #fff;
+    }
+
+    .filter-scroll-area {
+        flex: 1;
+        overflow-y: auto;
+        padding: 1rem;
+    }
+
+    .filter-group {
+        margin-bottom: 1.5rem;
+        background: #fff;
+        border-radius: 12px;
+        border: 1px solid rgba(0, 0, 0, 0.05);
+        overflow: hidden;
+    }
+
+    .filter-group-header {
+        padding: 0.75rem 1rem;
+        background: #f8f9fa;
+        font-weight: 600;
+        font-size: 0.9rem;
+        cursor: pointer;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .filter-group-content {
+        padding: 0.75rem;
+        max-height: 250px;
+        overflow-y: auto;
+    }
+
+    .filter-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0.4rem 0.5rem;
+        border-radius: 6px;
+        transition: background 0.2s;
+        cursor: pointer;
+    }
+
+    .filter-item:hover {
+        background: #f1f3f5;
+    }
+
+    .filter-item input {
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
+    }
+
+    .filter-item label {
+        font-size: 0.85rem;
+        margin: 0;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .search-input {
+        background: #f1f3f5;
+        border: none;
+        border-radius: 8px;
+        padding: 0.5rem 1rem;
+        font-size: 0.85rem;
+        width: 100%;
+        margin-top: 0.5rem;
+    }
+
+    .filter-badge {
+        background: #0d6efd;
+        color: white;
+        border-radius: 50%;
+        width: 18px;
+        height: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.7rem;
+    }
+</style>
+
 <div class="row mb-4">
     <div class="col">
-        <h2 class="fw-bold">@Model.ReportName</h2>
-        <p class="text-muted">Power BI Embedded Preview</p>
+        <h2 class="fw-bold m-0">@Model.ReportName</h2>
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a asp-controller="Workspace" asp-action="Index">Workspaces</a></li>
+                <li class="breadcrumb-item active">Preview</li>
+            </ol>
+        </nav>
     </div>
-    <div class="col-auto">
-        <button onclick="reloadReport()" class="btn btn-outline">
-            <i class="bi bi-arrow-clockwise me-2"></i>Refresh
+    <div class="col-auto d-flex gap-2 align-items-center">
+        <button onclick="exportToPdf()" id="exportBtn" class="btn btn-primary shadow-sm px-4">
+            <i class="bi bi-file-earmark-pdf me-2"></i>Export PDF
+        </button>
+        <button onclick="reloadReport()" class="btn btn-outline-secondary px-3">
+            <i class="bi bi-arrow-clockwise"></i>
         </button>
     </div>
 </div>
 
-<div class="d-flex" style="gap: 32px; align-items: flex-start; width: 100%;">
-    <!-- Sidebar Filters - Forced Wide Layout -->
-    <div class="flex-shrink-0" style="width: 400px; min-width: 400px; max-width: 400px;">
-        <div class="glass-card shadow-sm p-4" style="position: sticky; top: 20px; border: 1px solid #dee2e6;">
-            <div class="d-flex justify-content-between align-items-center mb-4">
-                <h4 class="fw-bold mb-0 text-dark"><i class="bi bi-filter-right me-2 text-primary"></i>Filters</h4>
-                <button onclick="loadDropdownValues()" class="btn btn-sm btn-light border" title="Refresh all">
-                    <i class="bi bi-arrow-clockwise"></i>
-                </button>
-            </div>
+<div class="row g-0 shadow-lg overflow-hidden" style="border-radius: 1.5rem; background: #fff;">
+    <!-- Main Report Area -->
+    <div class="col">
+        <div id="reportContainer" style="height: 850px; width: 100%;"></div>
+    </div>
 
-            <div id="filterInputs">
-                <div id="dynamicFilters" class="quick-filters" style="max-height: 600px; overflow-y: auto; overflow-x: hidden; padding-right: 5px;">
-                    <div class="text-center py-5">
-                        <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
-                        <p class="small text-muted mt-2">Connecting to report schema...</p>
-                    </div>
-                </div>
+    <!-- Professional Filter Sidebar -->
+    <div class="filter-sidebar" id="filterSidebar">
+        <div class="filter-header">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <h6 class="fw-bold m-0"><i class="bi bi-funnel me-2"></i>Filters</h6>
+                <button onclick="clearAllFilters()" class="btn btn-link btn-sm p-0 text-decoration-none">Clear all</button>
             </div>
-
-            <div class="mt-2 text-center">
-                <button onclick="forceResetSchema()" class="btn btn-link extra-small text-muted text-decoration-none">
-                    <i class="bi bi-shield-lock-fill me-1"></i> Force Discover (Premium Only)
-                </button>
-                <br/>
-                <button onclick="$('#manualFilterForm').toggle()" class="btn btn-link extra-small text-primary text-decoration-none">
-                    <i class="bi bi-plus-circle-fill me-1"></i> Add Filter Manually (Pro)
-                </button>
-            </div>
-
-            <div id="manualFilterForm" style="display:none;" class="mt-3 p-3 border rounded bg-light">
-                <p class="extra-small fw-bold mb-2">Add New Filter Mapping</p>
-                <input type="text" id="mDisplayName" class="form-control form-control-sm mb-2" placeholder="Display Name (e.g. Region)">
-                <input type="text" id="mTableName" class="form-control form-control-sm mb-2" placeholder="Table Name in PBI">
-                <input type="text" id="mColumnName" class="form-control form-control-sm mb-2" placeholder="Column Name in PBI">
-                <button onclick="saveManualFilter()" class="btn btn-sm btn-primary w-100">Save Filter</button>
-            </div>
-
-            <div id="filterActions" style="display:none;" class="mt-4 pt-3 border-top">
-                <button class="btn btn-primary w-100 mb-2 py-2 fw-bold" onclick="applyFilters()">
-                    Apply Filters
-                </button>
-                <button class="btn btn-link btn-sm w-100 text-muted text-decoration-none" onclick="clearFilters()">
-                    Reset All
-                </button>
+            <input type="text" class="search-input" placeholder="Search filters..." onkeyup="searchFilters(this.value)">
+        </div>
+        
+        <div class="filter-scroll-area" id="filterArea">
+            <div class="text-center py-5" id="filterLoader">
+                <div class="spinner-border text-primary spinner-border-sm" role="status"></div>
+                <p class="text-muted small mt-2">Discovering filters...</p>
             </div>
         </div>
     </div>
+</div>
 
-    <!-- Main Report Area -->
-    <div class="flex-grow-1" style="min-width: 0;">
-        <div class="glass-card p-0 overflow-hidden shadow border-0" style="border-radius: 1.25rem;">
-            <div id="reportContainer" class="report-container" style="height: 850px; width: 100%;"></div>
-        </div>
+<!-- Export Progress Overlay -->
+<div id="actionOverlay" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(255,255,255,0.9); z-index:9999; flex-direction:column; align-items:center; justify-content:center;">
+    <div class="text-center">
+        <div class="spinner-border text-primary mb-3" style="width: 3rem; height: 3rem;" role="status"></div>
+        <h4 class="fw-bold text-dark" id="actionStatus">Processing...</h4>
+        <p class="text-muted">Please wait while we prepare your file.</p>
     </div>
 </div>
 
 @section Scripts {
     <script>
         let report;
-        const reportType = '@Model.ReportType';
-        
+        const datasetId = '@Model.DatasetId';
+        let activeFilters = {}; // Key: "Table/Column", Value: [values]
+
         const config = {
             type: 'report',
-            tokenType: 1, // Embed
+            tokenType: 1, 
             accessToken: '@Model.EmbedToken',
             embedUrl: '@Model.EmbedUrl',
             id: '@Model.ReportId',
             settings: {
                 panes: {
-                    filters: { visible: false },
-                    pageNavigation: { visible: true }
+                    filters: { visible: false }, // We use our own custom pane
+                    pageNavigation: { visible: true, position: 0 }
                 }
             }
         };
 
         $(document).ready(function () {
-            console.log("[EMBED] Initializing for type:", reportType);
             const container = $('#reportContainer')[0];
             report = powerbi.embed(container, config);
-            
-            // Initial load
-            loadDropdownValues();
+
+            report.on("loaded", async () => {
+                console.log("[PREVIEW] Report loaded. Discovering filters...");
+                await loadFilters();
+            });
         });
 
-        async function loadDropdownValues() {
-            const reportId = '@Model.LocalReportId';
-            const datasetId = '@Model.DatasetId';
-            const isRdl = reportType === 'RDL' || reportType === 'Paginated';
-            const container = $('#dynamicFilters');
-            
-            console.log("[UI] Fetching filter metadata for Report:", reportId);
-
-            try {
-                const response = await fetch(`/Report/GetFilters?reportId=${reportId}`);
-                if (!response.ok) throw new Error("Failed to fetch filters");
-                
-                const filters = await response.json();
-                console.log("[UI] Found filters:", filters.length);
-
-                container.empty();
-
-                if (filters.length === 0) {
-                    container.html('<div class="text-center py-3"><p class="extra-small text-muted mb-0">No parameters discovered yet.</p><p class="extra-small text-primary cursor-pointer" onclick="forceResetSchema()">Click "Force Rediscover" to scan.</p></div>');
-                    $('#filterActions').hide();
-                    return;
-                }
-
-                filters.forEach(f => {
-                    const html = `
-                        <div class="mb-4 filter-item p-3 rounded shadow-sm border bg-white animate-fade-in">
-                            <div class="d-flex justify-content-between align-items-center mb-3">
-                                <label class="form-label small fw-bold text-dark mb-0">${f.displayName}</label>
-                                <span class="badge bg-light text-muted fw-normal" style="font-size: 0.65rem;">${f.tableName === 'RDL_PARAMETER' ? 'PARAM' : f.tableName}</span>
-                            </div>
-                            <div class="input-group">
-                                <select class="form-select bg-light border-0 filter-field py-2" 
-                                        data-table="${f.tableName}" 
-                                        data-column="${f.columnName}" 
-                                        style="font-size: 0.9rem;">
-                                    <option value="">Loading values...</option>
-                                </select>
-                                <button class="btn btn-white border border-start-0 text-primary" onclick="loadSingleDropdown('${f.columnName}')">
-                                    <i class="bi bi-arrow-clockwise"></i>
-                                </button>
-                            </div>
-                        </div>`;
-                    container.append(html);
-                });
-
-                $('#filterActions').show();
-
-                // Now load values for each
-                $('.filter-field').each(async function() {
-                    await loadSelectValues($(this));
-                });
-
-            } catch (err) {
-                console.error("[UI] Metadata Load Error:", err);
-                container.html('<p class="text-danger extra-small text-center">Connection error. Try refreshing.</p>');
-            }
-        }
-
-        async function loadSingleDropdown(columnName) {
-            const select = $(`.filter-field[data-column="${columnName}"]`);
-            await loadSelectValues(select);
-        }
-
-        async function loadSelectValues(select) {
-            const datasetId = '@Model.DatasetId';
-            const reportId = '@Model.ReportId';
-            const column = select.data('column');
-            const table = select.data('table');
-            
-            if (!table || !column) return;
-
-            try {
-                const wsId = '@Model.WorkspaceId';
-                const repGuid = config.id;
-
-                const url = `/Report/GetFilterValues?datasetId=${datasetId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&reportId=${repGuid}&workspaceId=${wsId}`;
-                const response = await fetch(url);
-                const values = await response.json();
-
-                let options = `<option value="">-- All --</option>`;
-                if (values && values.length > 0) {
-                    values.forEach(v => {
-                        options += `<option value="${v}">${v}</option>`;
-                    });
-                } else {
-                    options = `<option value="">No suggestions</option>`;
-                }
-                select.html(options);
-            } catch (err) {
-                console.error(`Error loading values for ${column}:`, err);
-                select.html(`<option value="">Error</option>`);
-            }
-        }
-
-        async function applyFilters() {
-            if (!report) return;
-            const btn = event.target;
-            const originalText = btn.innerText;
-            btn.innerText = "Applying...";
-            btn.disabled = true;
-
-            try {
-                const isRdl = reportType === 'RDL' || reportType === 'Paginated';
-                
-                if (isRdl) {
-                    const parameters = [];
-                    $('.filter-field').each(function() {
-                        const val = $(this).val();
-                        const paramName = $(this).data('column');
-                        if (val) {
-                            parameters.push({ name: paramName, value: val });
-                        }
-                    });
-
-                    console.log("[EMBED] Applying RDL Parameters:", parameters);
-                    await report.setParameters(parameters);
-                } 
-                else {
-                    const filters = [];
-                    $('.filter-field').each(function() {
-                        const val = $(this).val();
-                        const table = $(this).data('table');
-                        const column = $(this).data('column');
-                        
-                        if (val && table) {
-                            filters.push({
-                                $schema: "http://powerbi.com/product/schema#basic",
-                                target: { table: table, column: column },
-                                operator: "In",
-                                values: [val]
-                            });
-                        }
-                    });
-
-                    if (filters.length === 0) {
-                        await report.removeFilters();
-                    } else {
-                        await report.setFilters(filters);
-                    }
-                }
-            } catch (err) {
-                console.error("Filter Error:", err);
-                alert("Filter failed. Verify names in Report Builder.");
-            } finally {
-                btn.innerText = originalText;
-                btn.disabled = false;
-            }
-        }
-
-        async function clearFilters() {
-            if (!report) return;
-            try {
-                $('input, select').val('');
-                if (reportType === 'RDL' || reportType === 'Paginated') {
-                    report.reload();
-                } else {
-                    await report.removeFilters();
-                }
-            } catch (err) {
-                console.error("Clear Error:", err);
-            }
-        }
-
-        async function forceResetSchema() {
-            if (!confirm("Discovery will scan the RDL file/Dataset for parameters. Continue?")) return;
-
-            const reportId = '@Model.LocalReportId';
-            const container = $('#dynamicFilters');
-            container.html('<div class="text-center py-5"><div class="spinner-border spinner-border-sm text-primary" role="status"></div><p class="small text-muted mt-2">Scanning schema...</p></div>');
-            
-            try {
-                const response = await fetch(`/Report/ResetFilters?reportId=${reportId}`, { method: 'POST' });
-                const result = await response.json();
-                
-                if (response.ok) {
-                    console.log("[UI] Discovery Success:", result.message);
-                    await loadDropdownValues();
-                } else {
-                    throw new Error(result.message || "Discovery failed");
-                }
-            } catch (err) {
-                console.error("[UI] Discovery Error:", err);
-                container.html(`<div class="alert alert-danger extra-small p-2">Discovery failed: ${err.message}</div><button class="btn btn-sm btn-link" onclick="loadDropdownValues()">Try Again</button>`);
-            }
-        }
-        
-        function reloadReport() {
-            if (report) report.reload();
-        }
-        async function saveManualFilter() {
-            const reportId = '@Model.LocalReportId';
-            const displayName = $('#mDisplayName').val();
-            const tableName = $('#mTableName').val();
-            const columnName = $('#mColumnName').val();
-
-            if (!tableName || !columnName) {
-                alert("Table and Column names are required!");
+        async function loadFilters() {
+            if (!datasetId) {
+                $('#filterArea').html('<p class="text-muted text-center py-5">No dataset schema available.</p>');
                 return;
             }
 
             try {
-                const response = await fetch(`/Report/SaveManualFilter?reportId=${reportId}&displayName=${encodeURIComponent(displayName)}&tableName=${encodeURIComponent(tableName)}&columnName=${encodeURIComponent(columnName)}`, { method: 'POST' });
-                if (response.ok) {
-                    $('#manualFilterForm').hide();
-                    $('#mDisplayName, #mTableName, #mColumnName').val('');
-                    await loadDropdownValues();
-                } else {
-                    alert("Error saving filter.");
+                const response = await fetch(`/Report/GetDatasetSchema?datasetId=${datasetId}`);
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    $('#filterArea').html(`
+                        <div class="alert alert-info p-3 m-2 small shadow-sm" style="border-radius: 10px; background: rgba(13, 110, 253, 0.05); border: 1px solid rgba(13, 110, 253, 0.1);">
+                            <h6 class="fw-bold mb-1 text-primary"><i class="bi bi-cpu-fill me-2"></i>Smart Discovery</h6>
+                            <p class="mb-2 text-dark" style="font-size: 0.8rem;">Automatic scan is restricted. Use the Smart Scanner to read fields directly from your charts.</p>
+                            <button onclick="runSmartScan()" id="scanBtn" class="btn btn-sm btn-primary w-100 fw-bold">
+                                <i class="bi bi-search me-2"></i>Scan Report Visuals
+                            </button>
+                        </div>
+                        <div id="manualFilterArea"></div>
+                        <div class="text-center mt-3">
+                            <button onclick="promptManualFilter()" class="btn btn-link btn-sm text-decoration-none text-muted">
+                                <i class="bi bi-plus-circle me-1"></i>Add manually
+                            </button>
+                        </div>
+                    `);
+                    $('#filterLoader').hide();
+                    return;
+                }
+
+                const schema = data;
+                $('#filterLoader').hide();
+                const filterArea = $('#filterArea');
+                
+                // Only show top 8 columns to keep it clean, prioritized by common names
+                const prioritizedSchema = schema.sort((a, b) => {
+                    const keywords = ['date', 'month', 'category', 'gender', 'region', 'status'];
+                    const aScore = keywords.some(k => a.column.toLowerCase().includes(k)) ? 0 : 1;
+                    const bScore = keywords.some(k => b.column.toLowerCase().includes(k)) ? 0 : 1;
+                    return aScore - bScore;
+                }).slice(0, 10);
+
+                for (const field of prioritizedSchema) {
+                    const group = $(`
+                        <div class="filter-group" data-table="${field.table}" data-column="${field.column}">
+                            <div class="filter-group-header" onclick="$(this).next().slideToggle()">
+                                <span>${field.column}</span>
+                                <i class="bi bi-chevron-down small"></i>
+                            </div>
+                            <div class="filter-group-content">
+                                <div class="text-center p-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>
+                            </div>
+                        </div>
+                    `);
+                    filterArea.append(group);
+                    
+                    // Lazy load values for each column
+                    loadColumnValues(field.table, field.column, group.find('.filter-group-content'));
                 }
             } catch (err) {
-                console.error(err);
+                console.error("Filter Load Error:", err);
             }
+        }
+
+        async function loadColumnValues(table, column, container) {
+            try {
+                const response = await fetch(`/Report/GetFilterValues?datasetId=${datasetId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}`);
+                const values = await response.json();
+                
+                container.empty();
+                if (values.length === 0) throw new Error("No values");
+
+                values.forEach(val => {
+                    const item = $(`
+                        <div class="filter-item">
+                            <input type="checkbox" id="chk_${table}_${column}_${val}" onchange="toggleFilter('${table}', '${column}', '${val}', this.checked)">
+                            <label for="chk_${table}_${column}_${val}">${val}</label>
+                        </div>
+                    `);
+                    container.append(item);
+                });
+            } catch (err) {
+                // FALLBACK: Manual Value Input
+                container.empty().append(`
+                    <div class="p-2">
+                        <p class="text-muted small mb-2"><i class="bi bi-info-circle me-1"></i>Type value to filter:</p>
+                        <div class="input-group input-group-sm">
+                            <input type="text" class="form-control" placeholder="e.g. June" id="manual_val_${table}_${column}">
+                            <button class="btn btn-primary" onclick="applyManualValue('${table}', '${column}')">Apply</button>
+                        </div>
+                    </div>
+                `);
+            }
+        }
+
+        async function applyManualValue(table, column) {
+            const val = $(`#manual_val_${table}_${column}`).val();
+            if (!val) return;
+            
+            const key = `${table}/${column}`;
+            activeFilters[key] = [val]; // For manual entry, we treat it as a single-select override
+            
+            await applyAllFilters();
+        }
+
+        async function toggleFilter(table, column, value, isChecked) {
+            const key = `${table}/${column}`;
+            if (!activeFilters[key]) activeFilters[key] = [];
+
+            if (isChecked) {
+                activeFilters[key].push(value);
+            } else {
+                activeFilters[key] = activeFilters[key].filter(v => v !== value);
+            }
+
+            await applyAllFilters();
+        }
+
+        async function applyAllFilters() {
+            const pbiFilters = [];
+            
+            for (const key in activeFilters) {
+                const [table, column] = key.split('/');
+                const values = activeFilters[key];
+                
+                if (values.length > 0) {
+                    pbiFilters.push({
+                        $schema: "http://powerbi.com/product/schema#basic",
+                        target: { table: table, column: column },
+                        operator: "In",
+                        values: values
+                    });
+                }
+            }
+
+            console.log("[PREVIEW] Applying Filters:", pbiFilters);
+            await report.setFilters(pbiFilters);
+        }
+
+        async function clearAllFilters() {
+            $('input[type="checkbox"]').prop('checked', false);
+            activeFilters = {};
+            await report.removeFilters();
+        }
+
+        function searchFilters(query) {
+            const q = query.toLowerCase();
+            $('.filter-group').each(function() {
+                const text = $(this).find('.filter-group-header span').text().toLowerCase();
+                $(this).toggle(text.includes(q));
+            });
+        }
+
+        async function exportToPdf() {
+            const exportBtn = $('#exportBtn');
+            const overlay = $('#actionOverlay');
+            const originalHtml = exportBtn.html();
+            
+            $('#actionStatus').text("Exporting to PDF...");
+            exportBtn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Exporting...');
+            overlay.css('display', 'flex').hide().fadeIn();
+
+            try {
+                // Convert active filters to the format expected by the backend export
+                const exportFilters = [];
+                for (const key in activeFilters) {
+                    const [table, column] = key.split('/');
+                    const values = activeFilters[key];
+                    if (values.length > 0) {
+                        // Support multi-select in OData filter string for export
+                        const filterString = values.map(v => `${table}/${column} eq '${v}'`).join(' or ');
+                        exportFilters.push({
+                            filter: filterString
+                        });
+                    }
+                }
+
+                const response = await fetch(`/Report/ExportWithFilters?reportId=@Model.LocalReportId`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(exportFilters)
+                });
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `@Model.ReportName` + ".pdf";
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                } else {
+                    alert("Export failed.");
+                }
+            } catch (err) {
+                alert("An error occurred during export.");
+            } finally {
+                exportBtn.prop('disabled', false).html(originalHtml);
+                overlay.fadeOut();
+            }
+        }
+
+        async function runSmartScan() {
+            const btn = $('#scanBtn');
+            const original = btn.html();
+            btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Scanning...');
+
+            try {
+                const pages = await report.getPages();
+                const fieldsFound = new Set();
+
+                for (const page of pages) {
+                    const visuals = await page.getVisuals();
+                    for (const visual of visuals) {
+                        // Discover from existing filters on visuals or from underlying data targets
+                        const vFilters = await visual.getFilters();
+                        vFilters.forEach(f => {
+                            if (f.target && f.target.table && f.target.column) {
+                                fieldsFound.add(`${f.target.table}|${f.target.column}`);
+                            }
+                        });
+                    }
+                }
+
+                if (fieldsFound.size === 0) {
+                    alert("No active fields discovered. Please interact with the report visuals first, or click 'Add manually' to type a field name.");
+                } else {
+                    fieldsFound.forEach(fieldKey => {
+                        const [table, column] = fieldKey.split('|');
+                        addFilterGroup(table, column);
+                    });
+                }
+            } catch (err) {
+                console.error("Scan error:", err);
+                alert("Smart Scan failed. Please add fields manually.");
+            } finally {
+                btn.prop('disabled', false).html(original);
+            }
+        }
+
+        function addFilterGroup(table, column) {
+            // Check if already exists
+            if ($(`.filter-group[data-table="${table}"][data-column="${column}"]`).length > 0) return;
+
+            const area = $('#manualFilterArea');
+            const group = $(`
+                <div class="filter-group" data-table="${table}" data-column="${column}">
+                    <div class="filter-group-header" onclick="$(this).next().slideToggle()">
+                        <span>${column}</span>
+                        <i class="bi bi-chevron-down small"></i>
+                    </div>
+                    <div class="filter-group-content">
+                        <div class="text-center p-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>
+                    </div>
+                </div>
+            `);
+            area.prepend(group);
+            loadColumnValues(table, column, group.find('.filter-group-content'));
+        }
+
+        async function promptManualFilter() {
+            const table = prompt("Enter Table Name (e.g., Sales):");
+            if (!table) return;
+            const column = prompt("Enter Column Name (e.g., Month):");
+            if (!column) return;
+            addFilterGroup(table, column);
+        }
+
+        function reloadReport() {
+            if (report) report.reload();
         }
     </script>
 }
+

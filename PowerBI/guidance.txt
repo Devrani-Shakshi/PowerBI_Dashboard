@@ -1,0 +1,67 @@
+GUIDANCE: AUTOMATIC FOLDERS INSIDE POWER BI SERVICE WORKSPACES
+
+To create folders inside a Power BI Workspace automatically via code, you must use the Power BI REST API. Note: This feature is only available for Fabric or Premium capacities.
+
+--------------------------------------------------------------------------------
+STEP 1: Create the Folder via REST API
+--------------------------------------------------------------------------------
+You need a function that calls the 'Folders' endpoint.
+
+// C# Example for creating a folder
+public async Task<Guid> CreatePowerBIFolder(Guid workspaceId, string folderName)
+{
+    var token = await _auth.GetAccessToken();
+    using var client = new HttpClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    var url = $"https://api.powerbi.com/v1.0/myorg/groups/{workspaceId}/folders";
+    var content = new StringContent(JsonConvert.SerializeObject(new { displayName = folderName }), Encoding.UTF8, "application/json");
+
+    var response = await client.PostAsync(url, content);
+    var resultJson = await response.Content.ReadAsStringAsync();
+
+    if (response.IsSuccessStatusCode) {
+        var folder = JsonConvert.DeserializeObject<dynamic>(resultJson);
+        return (Guid)folder.id;
+    }
+    throw new Exception("Failed to create folder: " + resultJson);
+}
+
+--------------------------------------------------------------------------------
+STEP 2: Upload a Report into that Folder
+--------------------------------------------------------------------------------
+When uploading (Importing), you must pass the 'folderId' as a query parameter in the URL.
+
+// C# Example for uploading into a folder
+public async Task UploadToFolder(Guid workspaceId, Guid folderId, string reportName, Stream fileStream)
+{
+    var token = await _auth.GetAccessToken();
+    using var client = new HttpClient();
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+    // NOTICE THE 'folderId' PARAMETER AT THE END OF THE URL
+    var url = $"https://api.powerbi.com/v1.0/myorg/groups/{workspaceId}/imports?datasetDisplayName={reportName}&nameConflict=Abort&folderId={folderId}";
+
+    var content = new MultipartFormDataContent();
+    content.Add(new StreamContent(fileStream), "file", reportName);
+
+    var response = await client.PostAsync(url, content);
+    if (!response.IsSuccessStatusCode) {
+        throw new Exception("Upload failed: " + await response.Content.ReadAsStringAsync());
+    }
+}
+
+--------------------------------------------------------------------------------
+STEP 3: AUTOMATION LOGIC
+--------------------------------------------------------------------------------
+To make this "Automatic", your 'UploadReport' function should look like this:
+
+1. Check if folder "MyReports" exists in the Workspace (using GET .../folders API).
+2. If it does not exist, call 'CreatePowerBIFolder'.
+3. Store the 'folderId'.
+4. Call 'UploadToFolder' using that ID.
+
+--------------------------------------------------------------------------------
+IMPORTANT PERMISSIONS
+--------------------------------------------------------------------------------
+Your Service Principal MUST have 'Workspace.ReadWrite.All' or 'Content.Create' permissions in the Azure App Registration and be an 'Admin' or 'Contributor' in the Power BI Workspace.

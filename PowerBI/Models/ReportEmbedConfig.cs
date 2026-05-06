@@ -7,7 +7,7 @@ namespace PowerBI.Models
         public string? EmbedUrl { get; set; }
         public string? EmbedToken { get; set; }
         public string? ReportName { get; set; }
-        public string? ReportType { get; set; } // "RDL" or "PowerBI"
+        public string? ReportType { get; set; } 
         public int LocalReportId { get; set; }
         public string? WorkspaceId { get; set; }
         public System.Collections.Generic.Dictionary<string, string> Parameters { get; set; } = new();

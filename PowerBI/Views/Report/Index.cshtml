@@ -20,66 +20,127 @@
     </div>
 }
 
-<div class="glass-card border-0 animate-fade-in">
-    <div class="table-responsive">
-        <table class="table table-hover mb-0">
-            <thead>
-                <tr class="text-muted small uppercase">
-                    <th class="border-0 ps-4">Report Name</th>
-                    <th class="border-0">Type</th>
-                    <th class="border-0">Power BI ID</th>
-                    <th class="border-0 text-end pe-4">Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                @if (!Model.Any())
-                {
-                    <tr>
-                        <td colspan="4" class="text-center py-5 text-muted">
-                            <i class="bi bi-folder-x fs-2 d-block mb-2"></i>
-                            No reports found in this workspace.
-                        </td>
+<div class="d-flex flex-column animate-fade-in">
+    <!-- Breadcrumb Navigation -->
+    <nav aria-label="breadcrumb" class="mb-3 px-2">
+        <ol class="breadcrumb mb-0 py-2">
+            <li class="breadcrumb-item"><a href="#" onclick="navigateToRoot()" class="text-decoration-none"><i class="bi bi-house-door me-1"></i> @ViewBag.WorkspaceName</a></li>
+            <li class="breadcrumb-item active d-none" id="folderBreadcrumb"></li>
+        </ol>
+    </nav>
+
+    <div class="glass-card border-0 overflow-hidden shadow-sm">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 align-middle">
+                <thead>
+                    <tr class="text-muted small uppercase bg-light bg-opacity-50">
+                        <th class="border-0 ps-4" style="width: 40%">Name</th>
+                        <th class="border-0">Type</th>
+                        <th class="border-0">Status</th>
+                        <th class="border-0 text-end pe-4">Actions</th>
                     </tr>
-                }
-                @foreach (var r in Model)
-                {
-                    <tr class="align-middle">
-                        <td class="ps-4">
-                            <div class="d-flex align-items-center">
-                                <div class="bg-primary bg-opacity-10 p-2 rounded me-3">
-                                    <i class="bi bi-file-bar-graph text-primary"></i>
+                </thead>
+                <tbody id="reportTableBody">
+                    <!-- Folders -->
+                    @foreach (var f in (List<PowerBI.Models.Folder>)ViewBag.Folders)
+                    {
+                        <tr class="folder-row cursor-pointer" onclick="navigateToFolder('@f.Id', '@f.Name')" data-folder-id="@f.Id">
+                            <td class="ps-4">
+                                <div class="d-flex align-items-center">
+                                    <i class="bi bi-folder-fill text-warning fs-5 me-3"></i>
+                                    <span class="fw-bold">@f.Name</span>
                                 </div>
-                                <span class="fw-bold">@r.Name</span>
-                            </div>
-                        </td>
-                        <td>
-                            @if(r.ReportType == "RDL") {
-                                <span class="badge bg-warning bg-opacity-10 text-warning px-3">Paginated</span>
-                            } else {
-                                <span class="badge bg-info bg-opacity-10 text-info px-3">Power BI</span>
-                            }
-                        </td>
-                        <td class="text-muted small">
-                            <code>@(r.PowerBIReportId?.Length > 12 ? r.PowerBIReportId.Substring(0, 12) + "..." : r.PowerBIReportId)</code>
-                        </td>
-                        <td class="text-end pe-4">
-                            <div class="btn-group">
-                                <a asp-action="Preview" asp-route-reportId="@r.Id" class="btn btn-outline-primary btn-sm px-3">
-                                    <i class="bi bi-eye me-1"></i> Preview
-                                </a>
-                                <a asp-action="Export" asp-route-reportId="@r.Id" class="btn btn-outline-secondary btn-sm px-3 ms-2">
-                                    <i class="bi bi-file-earmark-pdf me-1"></i> PDF
-                                </a>
-                            </div>
-                        </td>
-                    </tr>
-                }
-            </tbody>
-        </table>
+                            </td>
+                            <td><span class="text-muted small">Folder</span></td>
+                            <td><span class="text-muted extra-small">--</span></td>
+                            <td class="text-end pe-4">
+                                <i class="bi bi-chevron-right text-muted small"></i>
+                            </td>
+                        </tr>
+                    }
+
+                    <!-- Reports -->
+                    @foreach (var r in Model)
+                    {
+                        <tr class="report-row" data-parent-folder="@(r.FolderId ?? 0)">
+                            <td class="ps-4">
+                                <div class="d-flex align-items-center">
+                                    <div class="bg-primary bg-opacity-10 p-2 rounded me-3">
+                                        <i class="bi bi-file-bar-graph text-primary"></i>
+                                    </div>
+                                    <span class="fw-bold">@r.Name</span>
+                                </div>
+                            </td>
+                            <td>
+                                <span class="text-muted small">@(r.ReportType == "RDL" ? "Paginated Report" : "Report")</span>
+                            </td>
+                            <td>
+                                <span class="badge bg-success bg-opacity-10 text-success rounded-pill px-2" style="font-size: 0.65rem;">Synced</span>
+                            </td>
+                            <td class="text-end pe-4">
+                                <div class="btn-group">
+                                    <a asp-action="Preview" asp-route-reportId="@r.Id" class="btn btn-sm btn-outline-primary rounded-pill px-3 me-1">View</a>
+                                    <a asp-action="Export" asp-route-reportId="@r.Id" class="btn btn-sm btn-outline-secondary rounded-pill px-3">PDF</a>
+                                </div>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
     </div>
 </div>
 
-<!-- Modal -->
+<script>
+    let currentFolderId = 0;
+
+    function navigateToFolder(id, name) {
+        currentFolderId = id;
+        
+        // Update Breadcrumb
+        const bc = document.getElementById('folderBreadcrumb');
+        bc.textContent = name;
+        bc.classList.remove('d-none');
+        
+        filterTable();
+    }
+
+    function navigateToRoot() {
+        currentFolderId = 0;
+        
+        // Update Breadcrumb
+        document.getElementById('folderBreadcrumb').classList.add('d-none');
+        
+        filterTable();
+    }
+
+    function filterTable() {
+        const rows = document.querySelectorAll('#reportTableBody tr');
+        
+        rows.forEach(row => {
+            if (row.classList.contains('folder-row')) {
+                // Folders are only visible at root
+                row.style.display = (currentFolderId == 0) ? '' : 'none';
+            } else if (row.classList.contains('report-row')) {
+                // Reports are visible if they match the current folder ID
+                const parentId = row.getAttribute('data-parent-folder');
+                row.style.display = (parentId == currentFolderId) ? '' : 'none';
+            }
+        });
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', filterTable);
+</script>
+
+<style>
+    .cursor-pointer { cursor: pointer; }
+    .folder-row:hover { background-color: rgba(255, 193, 7, 0.05) !important; }
+    .breadcrumb-item + .breadcrumb-item::before { content: ">"; }
+    .extra-small { font-size: 0.75rem; }
+</style>
+
+<!-- Modal remains the same but with improved folder picker -->
 <div class="modal fade" id="uploadReportModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content glass-card border-0">
@@ -91,22 +152,38 @@
                 <input type="hidden" name="workspaceId" value="@ViewBag.WorkspaceId" />
                 <div class="modal-body">
                     <div class="mb-3">
+                        <label class="form-label text-muted small">Target Folder</label>
+                        <div class="input-group">
+                            <span class="input-group-text bg-light border-light text-muted">
+                                <i class="bi bi-folder-plus"></i>
+                            </span>
+                            <input type="text" name="folderName" id="folderInput" class="form-control bg-light border-light" 
+                                   placeholder="e.g. Automated Reports, Q1-Sales, etc." 
+                                   list="existingFolders" />
+                            <datalist id="existingFolders">
+                                @foreach (var f in (List<PowerBI.Models.Folder>)ViewBag.Folders)
+                                {
+                                    <option value="@f.Name">@f.Name</option>
+                                }
+                            </datalist>
+                        </div>
+                        <div class="form-text extra-small mt-1">Type a new name to create a folder, or select from existing.</div>
+                    </div>
+                    <div class="mb-3">
                         <label class="form-label text-muted small">Select .pbix or .rdl file</label>
                         <input type="file" name="file" class="form-control bg-light border-light" required />
                     </div>
                     <div class="bg-light p-3 rounded-3 mb-3 border border-dashed">
-                        <p class="small fw-bold mb-2">Don't have a report? Download samples:</p>
+                        <p class="small fw-bold mb-2">Samples:</p>
                         <div class="d-flex gap-2">
                             <a href="/Dummy_RDL.rdl" download class="btn btn-sm btn-outline-dark">
-                                <i class="bi bi-download me-1"></i> Dummy RDL
+                                <i class="bi bi-download me-1"></i> RDL
                             </a>
                             <a href="https://github.com/microsoft/powerbi-desktop-samples/raw/main/Monthly%20Sales%20and%20Profit%20Sample.pbix" target="_blank" class="btn btn-sm btn-outline-dark">
-                                <i class="bi bi-file-earmark-bar-graph me-1"></i> Sample PBIX
+                                <i class="bi bi-file-earmark-bar-graph me-1"></i> PBIX
                             </a>
                         </div>
-                        <p class="text-muted extra-small mt-2 mb-0">Note: RDL reports require Premium capacity when using Service Principal.</p>
                     </div>
-                    <p class="text-info small"><i class="bi bi-info-circle me-1"></i> This file will be uploaded directly to the Power BI Service.</p>
                 </div>
                 <div class="modal-footer border-0 pt-0">
                     <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>

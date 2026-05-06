@@ -3,6 +3,7 @@ using PowerBI.Models;
 using PowerBI.Services;
 using PowerBI.Data;
 using System.Diagnostics;
+using Microsoft.PowerBI.Api.Models;
 
 namespace PowerBI.Controllers
 {
@@ -19,15 +20,28 @@ namespace PowerBI.Controllers
 
         public async Task<IActionResult> Index(int workspaceId)
         {
-            Console.WriteLine($"[REPORT] Listing reports for Local Workspace ID: {workspaceId}");
-            
+            return View(await GetReportsList(workspaceId));
+        }
+
+        public async Task<IActionResult> Sync(int workspaceId)
+        {
+            Console.WriteLine($"[REPORT] FORCED SYNC for Workspace ID: {workspaceId}");
+            var ws = _db.Workspaces.Find(workspaceId);
+            if (ws != null && !string.IsNullOrEmpty(ws.PowerBIWorkspaceId))
+            {
+                await _service.SyncReports(workspaceId, Guid.Parse(ws.PowerBIWorkspaceId), _db);
+            }
+            return RedirectToAction("Index", new { workspaceId });
+        }
+
+        private async Task<List<PowerBI.Models.Report>> GetReportsList(int workspaceId)
+        {
             var ws = _db.Workspaces.Find(workspaceId);
             if (ws == null || string.IsNullOrEmpty(ws.PowerBIWorkspaceId)) 
-                return RedirectToAction("Index", "Workspace");
+                return new List<PowerBI.Models.Report>();
 
             try
             {
-                // Sync reports within this workspace
                 await _service.SyncReports(workspaceId, Guid.Parse(ws.PowerBIWorkspaceId), _db);
             }
             catch (Exception ex)
@@ -38,19 +52,22 @@ namespace PowerBI.Controllers
 
             var reports = _db.Reports
                 .Where(r => r.WorkspaceId == workspaceId)
+                .OrderBy(r => r.FolderId)
+                .ToList();
+
+            var folders = _db.Folders
+                .Where(f => f.WorkspaceId == workspaceId)
                 .ToList();
 
             ViewBag.WorkspaceId = workspaceId;
             ViewBag.WorkspaceName = ws.Name;
-            Console.WriteLine($"[REPORT] Returning {reports.Count} synced reports.");
-
-            return View(reports);
+            ViewBag.Folders = folders;
+            return reports;
         }
 
-        [HttpPost]
-        public async Task<IActionResult> Upload(IFormFile file, int workspaceId)
+        public async Task<IActionResult> Upload(IFormFile file, int workspaceId, string? folderName)
         {
-            Console.WriteLine($"[REPORT] Uploading file: {file.FileName} to Workspace: {workspaceId}");
+            Console.WriteLine($"[REPORT] Uploading file: {file.FileName} to Workspace: {workspaceId} (Folder: {folderName})");
             
             var ws = _db.Workspaces.Find(workspaceId);
             if (ws == null || string.IsNullOrEmpty(ws.PowerBIWorkspaceId)) 
@@ -67,9 +84,12 @@ namespace PowerBI.Controllers
             {
                 using var stream = file.OpenReadStream();
                 var import = await _service.UploadReport(
+                    workspaceId,
                     Guid.Parse(ws.PowerBIWorkspaceId),
                     file.FileName,
-                    stream);
+                    stream,
+                    _db,
+                    folderName);
 
                 // Save locally after successful (or attempted) upload for record keeping
                 using (var fileStream = new FileStream(path, FileMode.Create))
@@ -86,17 +106,25 @@ namespace PowerBI.Controllers
                 var reportId = import.Reports.First().Id;
                 Console.WriteLine($"[REPORT] Import successful. Power BI Report ID: {reportId}");
 
-                _db.Reports.Add(new Report
+                // Look up folder ID if name provided
+                int? folderId = null;
+                if (!string.IsNullOrEmpty(folderName))
+                {
+                    folderId = await _service.GetOrCreateFolder(workspaceId, Guid.Parse(ws.PowerBIWorkspaceId), folderName, _db);
+                }
+
+                _db.Reports.Add(new PowerBI.Models.Report
                 {
                     Name = file.FileName,
                     PowerBIReportId = reportId.ToString(),
                     WorkspaceId = workspaceId,
                     FilePath = path,
+                    FolderId = folderId,
                     ReportType = file.FileName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? "RDL" : "PowerBI"
                 });
 
                 await _db.SaveChangesAsync();
-                Console.WriteLine("[REPORT] Record saved to local database.");
+                Console.WriteLine($"[REPORT] Record saved to local database (Folder ID: {folderId ?? 0}).");
 
                 return RedirectToAction("Index", new { workspaceId });
             }
@@ -128,7 +156,13 @@ namespace PowerBI.Controllers
 
         public async Task<IActionResult> Export(int reportId)
         {
-            Console.WriteLine($"[REPORT] Downloading PDF for Report ID: {reportId}");
+            return await ExportWithFilters(reportId, null);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> ExportWithFilters(int reportId, [FromBody] List<ExportFilter>? filters)
+        {
+            Console.WriteLine($"[REPORT] Exporting PDF for Report ID: {reportId} (Filters: {filters?.Count ?? 0})");
             
             var report = _db.Reports.Find(reportId);
             if (report == null || string.IsNullOrEmpty(report.PowerBIReportId)) return NotFound();
@@ -136,23 +170,34 @@ namespace PowerBI.Controllers
             var ws = _db.Workspaces.Find(report.WorkspaceId);
             if (ws == null || string.IsNullOrEmpty(ws.PowerBIWorkspaceId)) return BadRequest("Invalid Workspace");
 
-            var pdfStream = await _service.ExportReportAsStream(
-                Guid.Parse(ws.PowerBIWorkspaceId),
-                Guid.Parse(report.PowerBIReportId));
-
-            var fileName = $"{report.Name}_{DateTime.Now:yyyyMMddHHmmss}.pdf";
-            var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
-            var filePath = Path.Combine(uploadsDir, fileName);
-
-            using (var fileStream = new FileStream(filePath, FileMode.Create))
+            try
             {
-                await pdfStream.CopyToAsync(fileStream);
-            }
+                var pdfStream = await _service.ExportReportAsStream(
+                    Guid.Parse(ws.PowerBIWorkspaceId),
+                    Guid.Parse(report.PowerBIReportId),
+                    filters);
 
-            Console.WriteLine($"[REPORT] PDF saved to local server: {filePath}");
-            
-            var bytes = await System.IO.File.ReadAllBytesAsync(filePath);
-            return File(bytes, "application/pdf", fileName);
+                var fileName = $"{report.Name}_{DateTime.Now:yyyyMMddHHmmss}.pdf";
+                var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
+                if (!Directory.Exists(uploadsDir)) Directory.CreateDirectory(uploadsDir);
+                
+                var filePath = Path.Combine(uploadsDir, fileName);
+
+                using (var fileStream = new FileStream(filePath, FileMode.Create))
+                {
+                    await pdfStream.CopyToAsync(fileStream);
+                }
+
+                Console.WriteLine($"[REPORT] PDF saved to local server: {filePath}");
+                
+                var bytes = await System.IO.File.ReadAllBytesAsync(filePath);
+                return File(bytes, "application/pdf", fileName);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[REPORT] Export Error: {ex.Message}");
+                return BadRequest(new { message = "Export failed. Ensure the workspace is on a Fabric/Premium capacity and the Service Principal has 'Export to File' permissions." });
+            }
         }
 
         public async Task<IActionResult> Preview(int reportId)
@@ -247,6 +292,29 @@ namespace PowerBI.Controllers
 
             var values = await _service.GetColumnValues(dsGuid, table, column, repGuid, wsGuid);
             return Json(values);
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetDatasetSchema(string datasetId)
+        {
+            Console.WriteLine($"[CONTROLLER] GetDatasetSchema called for Dataset ID: {datasetId}");
+            if (string.IsNullOrEmpty(datasetId)) 
+            {
+                Console.WriteLine("[CONTROLLER] ERROR: Dataset ID is null or empty.");
+                return BadRequest("Dataset ID is required.");
+            }
+            
+            try 
+            {
+                var schema = await _service.GetDatasetTablesAndColumns(Guid.Parse(datasetId));
+                Console.WriteLine($"[CONTROLLER] Schema discovery successful. Found {schema.Count} fields.");
+                return Json(schema);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[CONTROLLER] ERROR in GetDatasetSchema: {ex.Message}");
+                return BadRequest(new { message = ex.Message });
+            }
         }
 
     }

@@ -10,6 +10,7 @@ namespace PowerBI.Data
         public DbSet<User> Users { get; set; }
         public DbSet<Workspace> Workspaces { get; set; }
         public DbSet<Report> Reports { get; set; }
+        public DbSet<Folder> Folders { get; set; }
         public DbSet<ReportFilter> ReportFilters { get; set; }
     }
 }
