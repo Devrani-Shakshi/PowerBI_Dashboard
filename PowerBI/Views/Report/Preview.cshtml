@@ -136,7 +136,15 @@
         <div class="filter-header">
             <div class="d-flex justify-content-between align-items-center mb-2">
                 <h6 class="fw-bold m-0"><i class="bi bi-funnel me-2"></i>Filters</h6>
-                <button onclick="clearAllFilters()" class="btn btn-link btn-sm p-0 text-decoration-none">Clear all</button>
+                <div class="d-flex gap-2">
+                    @if (Model.ReportType == "RDL")
+                    {
+                        <button onclick="discoverRdlParameters()" id="rdlSyncBtn" class="btn btn-link btn-sm p-0 text-decoration-none text-primary" title="Sync Parameters">
+                            <i class="bi bi-arrow-repeat"></i>
+                        </button>
+                    }
+                    <button onclick="clearAllFilters()" class="btn btn-link btn-sm p-0 text-decoration-none">Clear all</button>
+                </div>
             </div>
             <input type="text" class="search-input" placeholder="Search filters..." onkeyup="searchFilters(this.value)">
         </div>
@@ -163,17 +171,29 @@
     <script>
         let report;
         const datasetId = '@Model.DatasetId';
+        const reportType = '@Model.ReportType';
+        const localReportId = '@Model.LocalReportId';
+        const pbiWorkspaceId = '@Model.WorkspaceId';
         let activeFilters = {}; // Key: "Table/Column", Value: [values]
+        let availableFilters = [];
+
+        let embedUrl = '@Model.EmbedUrl';
+        
+        // Initial Background Injection for RDL
+        if (reportType === 'RDL' || reportType === 'PaginatedReport') {
+            const separator = embedUrl.includes('?') ? '&' : '?';
+            embedUrl += `${separator}rp:TenantId=PROD-TENANT-001`;
+        }
 
         const config = {
             type: 'report',
             tokenType: 1, 
             accessToken: '@Model.EmbedToken',
-            embedUrl: '@Model.EmbedUrl',
+            embedUrl: embedUrl,
             id: '@Model.ReportId',
             settings: {
                 panes: {
-                    filters: { visible: false }, // We use our own custom pane
+                    filters: { visible: false }, 
                     pageNavigation: { visible: true, position: 0 }
                 }
             }
@@ -187,19 +207,34 @@
                 console.log("[PREVIEW] Report loaded. Discovering filters...");
                 await loadFilters();
             });
+
+            report.on("error", function (event) {
+                console.error("[PREVIEW] Report Error Detail:", event.detail);
+                if (event.detail.message) {
+                    alert("Power BI Error: " + event.detail.message);
+                }
+            });
         });
 
         async function loadFilters() {
-            if (!datasetId) {
+            if (!datasetId && reportType !== 'RDL') {
                 $('#filterArea').html('<p class="text-muted text-center py-5">No dataset schema available.</p>');
                 return;
             }
 
             try {
-                const response = await fetch(`/Report/GetDatasetSchema?datasetId=${datasetId}`);
+                let url = `/Report/GetDatasetSchema?datasetId=${datasetId}`;
+                
+                // RDL reports don't have datasets; they have parameters in our DB
+                if (reportType === 'RDL') {
+                    url = `/Report/GetFilters?reportId=${localReportId}`;
+                }
+
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 if (!response.ok) {
+                    $('#filterLoader').hide();
                     $('#filterArea').html(`
                         <div class="alert alert-info p-3 m-2 small shadow-sm" style="border-radius: 10px; background: rgba(13, 110, 253, 0.05); border: 1px solid rgba(13, 110, 253, 0.1);">
                             <h6 class="fw-bold mb-1 text-primary"><i class="bi bi-cpu-fill me-2"></i>Smart Discovery</h6>
@@ -215,27 +250,36 @@
                             </button>
                         </div>
                     `);
-                    $('#filterLoader').hide();
                     return;
                 }
 
-                const schema = data;
+                availableFilters = data;
                 $('#filterLoader').hide();
                 const filterArea = $('#filterArea');
                 
                 // Only show top 8 columns to keep it clean, prioritized by common names
-                const prioritizedSchema = schema.sort((a, b) => {
+                // Sort columns: prioritize common names like 'date', 'month', etc.
+                const prioritizedSchema = availableFilters.sort((a, b) => {
+                    const colA = (a.columnName || a.column || "").toLowerCase();
+                    const colB = (b.columnName || b.column || "").toLowerCase();
                     const keywords = ['date', 'month', 'category', 'gender', 'region', 'status'];
-                    const aScore = keywords.some(k => a.column.toLowerCase().includes(k)) ? 0 : 1;
-                    const bScore = keywords.some(k => b.column.toLowerCase().includes(k)) ? 0 : 1;
+                    const aScore = keywords.some(k => colA.includes(k)) ? 0 : 1;
+                    const bScore = keywords.some(k => colB.includes(k)) ? 0 : 1;
                     return aScore - bScore;
-                }).slice(0, 10);
+                }).slice(0, 15);
 
-                for (const field of prioritizedSchema) {
+                for (let field of availableFilters) {
+                    // Map database property names to local names if needed
+                    const table = field.tableName || field.table;
+                    const column = field.columnName || field.column;
+
+                    // HIDE SECURITY PARAMETERS FROM UI
+                    if (column === 'TenantId') continue;
+
                     const group = $(`
-                        <div class="filter-group" data-table="${field.table}" data-column="${field.column}">
+                        <div class="filter-group" data-table="${table}" data-column="${column}">
                             <div class="filter-group-header" onclick="$(this).next().slideToggle()">
-                                <span>${field.column}</span>
+                                <span>${column}</span>
                                 <i class="bi bi-chevron-down small"></i>
                             </div>
                             <div class="filter-group-content">
@@ -246,7 +290,7 @@
                     filterArea.append(group);
                     
                     // Lazy load values for each column
-                    loadColumnValues(field.table, field.column, group.find('.filter-group-content'));
+                    loadColumnValues(table, column, group.find('.filter-group-content'));
                 }
             } catch (err) {
                 console.error("Filter Load Error:", err);
@@ -255,7 +299,9 @@
 
         async function loadColumnValues(table, column, container) {
             try {
-                const response = await fetch(`/Report/GetFilterValues?datasetId=${datasetId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}`);
+                // IMPORTANT: Use reportId (GUID) not localReportId (Integer) for the Power BI API
+                let url = `/Report/GetFilterValues?datasetId=${datasetId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&reportId=@Model.ReportId&workspaceId=${pbiWorkspaceId}`;
+                const response = await fetch(url);
                 const values = await response.json();
                 
                 container.empty();
@@ -308,6 +354,71 @@
         }
 
         async function applyAllFilters() {
+            console.log("[PREVIEW] applyAllFilters called. reportType is:", reportType);
+            
+            if (reportType === 'RDL' || reportType === 'PaginatedReport') {
+                const rdlParameters = [];
+                for (const key in activeFilters) {
+                    const [table, column] = key.split('/');
+                    const values = activeFilters[key];
+                    if (values.length > 0) {
+                        rdlParameters.push({
+                            name: column,
+                            value: values[0] 
+                        });
+                    }
+                }
+                console.log("[PREVIEW] Applying RDL Parameters:", rdlParameters);
+                
+                try {
+                    console.log("[PREVIEW] Updating RDL Parameters via URL refresh...");
+                    
+                    let baseEmbedUrl = '@Model.EmbedUrl';
+                    // Ensure the URL has a separator
+                    let separator = baseEmbedUrl.includes('?') ? '&' : '?';
+                    
+                    let paramString = "";
+                    
+                    // Build RDL Parameter String
+                    let hasTenantId = false;
+                    for (const p of rdlParameters) {
+                        if (p.name === 'TenantId') hasTenantId = true;
+                        
+                        if (p.value) {
+                            paramString += `${separator}rp:${encodeURIComponent(p.name)}=${encodeURIComponent(p.value)}`;
+                            separator = '&';
+                        }
+                    }
+
+                    // Only inject background TenantId if the report engine expects it
+                    if (!hasTenantId) {
+                        // Check if TenantId is among our synced filters
+                        const tenantFilter = availableFilters.find(f => (f.columnName || f.column) === 'TenantId');
+                        if (tenantFilter) {
+                             paramString += `${separator}rp:TenantId=PROD-TENANT-001`;
+                             separator = '&';
+                        }
+                    }
+
+                    const finalUrl = baseEmbedUrl + paramString;
+                    console.log(">>>> [BROWSER-DEBUG] Final RDL Embed URL:", finalUrl);
+
+                    const updatedConfig = {
+                        ...config,
+                        embedUrl: finalUrl
+                    };
+                    
+                    // CLEAN REFRESH: Clear the container first to prevent iframe conflicts
+                    powerbi.reset($('#reportContainer')[0]);
+                    
+                    console.log("[PREVIEW] URL Refresh triggered with final URL:", updatedConfig.embedUrl);
+                    report = powerbi.embed($('#reportContainer')[0], updatedConfig);
+                } catch (e) {
+                    console.error("[PREVIEW] Failed to apply RDL parameters:", e);
+                }
+                return;
+            }
+
             const pbiFilters = [];
             
             for (const key in activeFilters) {
@@ -460,6 +571,30 @@
 
         function reloadReport() {
             if (report) report.reload();
+        }
+
+        async function discoverRdlParameters() {
+            const btn = $('#rdlSyncBtn');
+            btn.addClass('fa-spin').prop('disabled', true);
+            
+            try {
+                const response = await fetch(`/Report/ResetFilters?reportId=${localReportId}`, { method: 'POST' });
+                if (response.ok) {
+                    $('#filterArea').empty().append(`
+                        <div class="text-center py-5" id="filterLoader">
+                            <div class="spinner-border text-primary spinner-border-sm" role="status"></div>
+                            <p class="text-muted small mt-2">Refreshing parameters...</p>
+                        </div>
+                    `);
+                    await loadFilters();
+                } else {
+                    alert("Discovery failed. Ensure the .rdl file exists in wwwroot/uploads/");
+                }
+            } catch (err) {
+                alert("An error occurred during discovery.");
+            } finally {
+                btn.removeClass('fa-spin').prop('disabled', false);
+            }
         }
     </script>
 }

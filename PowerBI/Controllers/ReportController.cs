@@ -91,11 +91,7 @@ namespace PowerBI.Controllers
                     _db,
                     folderName);
 
-                // Save locally after successful (or attempted) upload for record keeping
-                using (var fileStream = new FileStream(path, FileMode.Create))
-                {
-                    await file.OpenReadStream().CopyToAsync(fileStream);
-                }
+                // The service now handles saving the (normalized) file locally
 
                 if (import.Reports == null || !import.Reports.Any())
                 {
@@ -175,7 +171,9 @@ namespace PowerBI.Controllers
                 var pdfStream = await _service.ExportReportAsStream(
                     Guid.Parse(ws.PowerBIWorkspaceId),
                     Guid.Parse(report.PowerBIReportId),
-                    filters);
+                    filters,
+                    report.ReportType,
+                    _db);
 
                 var fileName = $"{report.Name}_{DateTime.Now:yyyyMMddHHmmss}.pdf";
                 var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
@@ -290,7 +288,10 @@ namespace PowerBI.Controllers
             Guid? repGuid = !string.IsNullOrEmpty(reportId) ? Guid.Parse(reportId) : (Guid?)null;
             Guid? wsGuid = !string.IsNullOrEmpty(workspaceId) ? Guid.Parse(workspaceId) : (Guid?)null;
 
-            var values = await _service.GetColumnValues(dsGuid, table, column, repGuid, wsGuid);
+            if (repGuid.HasValue) 
+                Console.WriteLine($">>>> [TERMINAL-LOG] Fetching values for Parameter: '{column}' (Report: {reportId})");
+
+            var values = await _service.GetColumnValues(dsGuid, table, column, repGuid, wsGuid, _db);
             return Json(values);
         }
 
