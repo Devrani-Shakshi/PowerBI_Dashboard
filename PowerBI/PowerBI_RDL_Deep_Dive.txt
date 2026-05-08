@@ -1,0 +1,97 @@
+========================================================================
+POWER BI RDL ENGINE: COMPREHENSIVE ARCHITECTURAL DEEP DIVE
+========================================================================
+
+This document provides a line-by-line, multi-layered explanation of how this 
+application handles, modifies, and synchronizes Paginated Reports (RDL).
+
+------------------------------------------------------------------------
+1. ARCHITECTURAL OVERVIEW
+------------------------------------------------------------------------
+The system operates on a "Local-First, Cloud-Synced" architecture.
+- Source of Truth: Local .rdl files in 'wwwroot/uploads/'.
+- Presentation: Power BI Service (Fabric Workspace).
+- Bridge: PowerBIService.cs (The Engine).
+
+------------------------------------------------------------------------
+2. THE RDL FORMAT (THE XML FRAME)
+------------------------------------------------------------------------
+RDL (Report Definition Language) is a strict XML schema. 
+- Namespace: http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition
+- Structure: <Report> -> <DataSources> -> <DataSets> -> <ReportParameters> -> <ReportSections>
+
+Our engine treats the RDL not as text, but as an Object Model using 'XDocument'.
+
+------------------------------------------------------------------------
+3. THE INJECTION FLOW (Line-by-Line)
+------------------------------------------------------------------------
+Method: InjectManualFilterToRdl(int localReportId, string paramName, AppDbContext db)
+
+STEP 1: INITIALIZATION
+- Line: var report = db.Reports.Find(localReportId);
+  Explanation: Fetches the report metadata from SQL Server. We need the local file path.
+- Line: var filePath = Path.Combine(_webHostEnvironment.WebRootPath, report.FilePath);
+  Explanation: Resolves the physical path on the web server (e.g., C:\...\wwwroot\uploads\Invoice.rdl).
+
+STEP 2: XML MODIFICATION (CLONING STRATEGY)
+- Line: var xDoc = XDocument.Load(filePath);
+  Explanation: Loads the RDL into a tree structure. 
+- Line: var ns = xDoc.Root.GetDefaultNamespace();
+  Explanation: Dynamically captures the RDL version (2010 vs 2016) so we don't break the schema.
+- Line: var existingParam = paramsNode.Elements(ns + "ReportParameter").FirstOrDefault();
+  Explanation: We find an existing, valid parameter.
+- Line: var newParam = new XElement(existingParam);
+  Explanation: We CLONE the existing parameter. This is the safest way to ensure that all internal Power BI flags (rd:Designer, etc.) are copied correctly.
+- Line: newParam.Attribute("Name").Value = paramName;
+  Explanation: Changes the name to your custom field (e.g., "Item").
+- Line: newParam.RemoveNodes();
+  Explanation: Wipes out the old values (like Company names) to make it a clean "Manual Entry" parameter.
+
+STEP 3: LAYOUT RESET
+- Line: xDoc.Root.Element(ns + "ReportParametersLayout")?.Remove();
+  Explanation: This is CRITICAL. Modern RDLs have a grid-map for parameters. If we add a parameter but don't update the map, Power BI throws "Corrupted". By deleting it, we force Power BI to rebuild a perfect map automatically.
+
+STEP 4: SQL INJECTION
+- Line: cmdNode.Value = cmdNode.Value.Replace("</CommandText>", $" AND {paramName} = @{paramName}</CommandText>");
+  Explanation: We "wire up" the parameter to the SQL query. When the report runs, it will now filter the database using the value you provided in the dashboard.
+
+------------------------------------------------------------------------
+4. THE UPLOAD FLOW (FORMAT & APIs)
+------------------------------------------------------------------------
+STEP 5: BINARY SIGNING (BOM)
+- Format: UTF-8 with Preamble (BOM).
+- Logic: Power BI's RDL parser is legacy. It looks for the Byte Order Mark (0xEF, 0xBB, 0xBF).
+- Code: writerSettings = new XmlWriterSettings { Encoding = new UTF8Encoding(true) };
+  Explanation: 'true' tells the system to inject the BOM signature. Without this, re-uploads often fail.
+
+STEP 6: THE "CLEAN RE-BIRTH"
+- API: Reports.DeleteReportInGroupAsync
+  Explanation: We DELETE the report first. Power BI does not allow "Schema Updates" via overwrite for RDLs.
+- Wait: await Task.Delay(5000);
+  Explanation: We wait 5 seconds. This allows the global Power BI cache to clear the report ID.
+- API: Imports.PostImportWithFileAsync
+  Format: Multipart/form-data.
+  DatasetDisplayName: report.Name (stripped of .rdl).
+  Explanation: This pushes the file as a "Fresh Import".
+
+------------------------------------------------------------------------
+5. DATABASE FIELDS & SYNC
+------------------------------------------------------------------------
+- Table: Reports
+  Field: PowerBIReportId (Guid)
+  Explanation: Updated after every injection. Since we Delete/Re-upload, the GUID changes. We must save the new one or the "Preview" page will show 404.
+  
+- Table: ReportFilters
+  Field: ColumnName
+  Explanation: Stores your "Item" or "ProductDesc" label so the sidebar can render it.
+
+------------------------------------------------------------------------
+6. SUMMARY OF METHODS & CLASSES
+------------------------------------------------------------------------
+- PowerBIService.cs: The heart of the system. Handles all XML and API logic.
+- Microsoft.PowerBI.Api: The official .NET SDK for Azure/PowerBI.
+- XDocument / XElement: Used for high-fidelity XML manipulation.
+- MemoryStream: Used to handle the file in RAM so we never have "File Locked" errors during upload.
+
+Every line of this engine was built to handle the specific quirks of Power BI Paginated Reports, ensuring that your manual filters are not just "visual placeholders" but active, data-filtering tools.
+========================================================================

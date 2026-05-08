@@ -331,6 +331,12 @@ UNION ALL SELECT 'Berlin', 'Furniture', 1100, '2026-01-05') AS [DummyData] WHERE
       </Page>
     </ReportSection>
   </ReportSections>
+  <ReportParametersLayout>
+    <GridLayoutDefinition>
+      <NumberOfColumns>4</NumberOfColumns>
+      <NumberOfRows>2</NumberOfRows>
+    </GridLayoutDefinition>
+  </ReportParametersLayout>
   <rd:ReportUnitType>Inch</rd:ReportUnitType>
   <rd:ReportID>f1a2b3c4-d5e6-4f7g-8h9i-j0k1l2m3n4o5</rd:ReportID>
   <ReportParameters>
@@ -338,7 +344,6 @@ UNION ALL SELECT 'Berlin', 'Furniture', 1100, '2026-01-05') AS [DummyData] WHERE
       <DataType>String</DataType>
       <Nullable>true</Nullable>
       <Prompt>TenantId</Prompt>
-      <Hidden>true</Hidden>
     </ReportParameter>
   </ReportParameters>
 </Report>

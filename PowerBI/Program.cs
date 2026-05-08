@@ -54,6 +54,15 @@ using (var scope = app.Services.CreateScope())
                 PRINT 'Added FolderId column to Reports table.';
             END
         ");
+
+        Console.WriteLine("[DB] Checking for ReportFilters.IsCustom column...");
+        db.Database.ExecuteSqlRaw(@"
+            IF NOT EXISTS (SELECT * FROM sys.columns WHERE Name = N'IsCustom' AND Object_ID = OBJECT_ID(N'[dbo].[ReportFilters]'))
+            BEGIN
+                ALTER TABLE [dbo].[ReportFilters] ADD [IsCustom] bit NOT NULL DEFAULT 0;
+                PRINT 'Added IsCustom column to ReportFilters table.';
+            END
+        ");
     }
     catch (Exception ex)
     {

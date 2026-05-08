@@ -65,20 +65,18 @@ namespace PowerBI.Controllers
             return reports;
         }
 
-        public async Task<IActionResult> Upload(IFormFile file, int workspaceId, string? folderName)
+        public async Task<IActionResult> Upload(IFormFile file, int workspaceId, string? folderName, string? targetFields)
         {
-            Console.WriteLine($"[REPORT] Uploading file: {file.FileName} to Workspace: {workspaceId} (Folder: {folderName})");
+            Console.WriteLine($"[REPORT] Uploading file: {file.FileName} to Workspace: {workspaceId} (Fields: {targetFields})");
             
             var ws = _db.Workspaces.Find(workspaceId);
             if (ws == null || string.IsNullOrEmpty(ws.PowerBIWorkspaceId)) 
             {
-                Console.WriteLine("[REPORT] ERROR: Workspace not found.");
                 return BadRequest("Invalid Workspace");
             }
 
-            var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
-            if (!Directory.Exists(uploadsDir)) Directory.CreateDirectory(uploadsDir);
-            var path = Path.Combine(uploadsDir, file.FileName);
+            // Parse target fields
+            var customParams = targetFields?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? new List<string>();
 
             try 
             {
@@ -89,39 +87,55 @@ namespace PowerBI.Controllers
                     file.FileName,
                     stream,
                     _db,
-                    folderName);
-
-                // The service now handles saving the (normalized) file locally
+                    folderName,
+                    customParams);
 
                 if (import.Reports == null || !import.Reports.Any())
                 {
-                    Console.WriteLine("[REPORT] ERROR: Power BI Import returned no reports.");
-                    return BadRequest("Import failed or no reports found.");
+                    return BadRequest("Import failed.");
                 }
 
-                var reportId = import.Reports.First().Id;
-                Console.WriteLine($"[REPORT] Import successful. Power BI Report ID: {reportId}");
-
-                // Look up folder ID if name provided
+                var pbiReportId = import.Reports.First().Id;
+                
+                // Look up folder ID
                 int? folderId = null;
                 if (!string.IsNullOrEmpty(folderName))
-                {
                     folderId = await _service.GetOrCreateFolder(workspaceId, Guid.Parse(ws.PowerBIWorkspaceId), folderName, _db);
-                }
 
-                _db.Reports.Add(new PowerBI.Models.Report
+                var newReport = new PowerBI.Models.Report
                 {
-                    Name = file.FileName,
-                    PowerBIReportId = reportId.ToString(),
+                    Name = file.FileName.Replace(" ", "_").Replace("(", "").Replace(")", ""),
+                    PowerBIReportId = pbiReportId.ToString(),
                     WorkspaceId = workspaceId,
-                    FilePath = path,
+                    FilePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", file.FileName.Replace(" ", "_").Replace("(", "").Replace(")", "")),
                     FolderId = folderId,
                     ReportType = file.FileName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? "RDL" : "PowerBI"
-                });
+                };
+
+                _db.Reports.Add(newReport);
+                await _db.SaveChangesAsync();
+
+                // Save Custom Filters to DB so they show up in UI immediately
+                foreach (var field in customParams)
+                {
+                    _db.ReportFilters.Add(new ReportFilter
+                    {
+                        ReportId = newReport.Id,
+                        ColumnName = field,
+                        DisplayName = field,
+                        IsActive = true,
+                        IsCustom = true,
+                        TableName = "Custom"
+                    });
+                }
+                
+                // Add TenantId as a background system filter if it's an RDL
+                if (newReport.ReportType == "RDL")
+                {
+                    _db.ReportFilters.Add(new ReportFilter { ReportId = newReport.Id, ColumnName = "TenantId", DisplayName = "Tenant ID", IsActive = true, IsCustom = false, TableName = "System" });
+                }
 
                 await _db.SaveChangesAsync();
-                Console.WriteLine($"[REPORT] Record saved to local database (Folder ID: {folderId ?? 0}).");
-
                 return RedirectToAction("Index", new { workspaceId });
             }
             catch (Exception ex)
@@ -247,6 +261,99 @@ namespace PowerBI.Controllers
             }
         }
 
+        [HttpPost]
+        public async Task<IActionResult> SaveCustomFilter([FromBody] CustomFilterRequest req)
+        {
+            var report = await _db.Reports.FindAsync(req.ReportId);
+            if (report == null) return NotFound();
+
+            var workspace = await _db.Workspaces.FindAsync(report.WorkspaceId);
+            if (workspace == null) return BadRequest("Workspace not found");
+
+            Console.WriteLine($"[CONTROLLER] Adding custom filter '{req.DisplayName}' for report '{report.Name}'");
+
+            // 1. If RDL, we must inject into the XML and RE-UPLOAD
+            if (report.ReportType == "RDL")
+            {
+                try 
+                {
+                    Console.WriteLine($"[STEP 1/4] Starting RDL XML Injection for filter: {req.ColumnName}");
+                    await _service.InjectManualFilterToRdl(report.Id, req.ColumnName, _db);
+                    Console.WriteLine($"[STEP 2/4] Injection complete. Preparing re-upload for: {report.Name}");
+
+                    // Save old Report ID so we can delete the stale copy later
+                    var oldPbiReportId = report.PowerBIReportId;
+
+                    // Re-upload to Power BI to replace existing
+                    var fileName = report.Name.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? report.Name : $"{report.Name}.rdl";
+                    var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fileName);
+                    
+                    if (string.IsNullOrEmpty(workspace.PowerBIWorkspaceId))
+                        throw new Exception("Power BI Workspace ID is missing.");
+
+                    // Small delay to let OS release file handle if necessary
+                    await Task.Delay(500);
+
+                    Console.WriteLine($"[STEP 3/4] Opening file stream for re-upload: {filePath}");
+                    Import importResult;
+                    using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        Console.WriteLine($"[STEP 4/4] Uploading to Power BI workspace: {workspace.PowerBIWorkspaceId}");
+                        importResult = await _service.UploadReport(
+                            report.WorkspaceId,
+                            Guid.Parse(workspace.PowerBIWorkspaceId),
+                            fileName,
+                            stream,
+                            _db,
+                            "Automated Reports");
+                    }
+
+                    // CRITICAL: Update local DB with the NEW report ID from Power BI
+                    if (importResult?.Reports != null && importResult.Reports.Any())
+                    {
+                        var newReportId = importResult.Reports.First().Id.ToString();
+                        Console.WriteLine($"[STEP 5/5] Updating local DB: {oldPbiReportId} -> {newReportId}");
+                        report.PowerBIReportId = newReportId;
+                        await _db.SaveChangesAsync();
+                    }
+                    else
+                    {
+                        Console.WriteLine("[WARNING] Import succeeded but no report ID returned. Embed may use stale ID.");
+                    }
+
+                    Console.WriteLine("[SUCCESS] RDL Filter injected and report re-uploaded to Power BI.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERROR] RDL Filter process failed: {ex.Message}");
+                    return BadRequest(new { message = $"RDL Update Failed: {ex.Message}" });
+                }
+            }
+
+            // 2. Save metadata to DB so it shows in sidebar
+            var newFilter = new PowerBI.Models.ReportFilter
+            {
+                ReportId = req.ReportId,
+                TableName = req.TableName ?? (report.ReportType == "RDL" ? "RDL_PARAMETER" : "Custom"),
+                ColumnName = req.ColumnName,
+                DisplayName = req.DisplayName,
+                IsActive = true
+            };
+
+            _db.ReportFilters.Add(newFilter);
+            await _db.SaveChangesAsync();
+
+            return Ok(new { message = "Filter added successfully." });
+        }
+
+        public class CustomFilterRequest
+        {
+            public int ReportId { get; set; }
+            public string DisplayName { get; set; }
+            public string TableName { get; set; }
+            public string ColumnName { get; set; }
+        }
+
         [HttpGet]
         public async Task<IActionResult> GetFilters(int reportId)
         {
@@ -275,7 +382,42 @@ namespace PowerBI.Controllers
             _db.ReportFilters.Add(filter);
             await _db.SaveChangesAsync();
 
+            // If it's an RDL report, permanently inject the filter into the XML and re-upload
+            var report = await _db.Reports.FindAsync(reportId);
+            if (report != null && report.ReportType == "RDL")
+            {
+                await _service.InjectManualFilterToRdl(reportId, columnName, _db);
+            }
+
             return Ok(new { message = "Filter added successfully." });
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Delete(int reportId)
+        {
+            var report = await _db.Reports.FindAsync(reportId);
+            if (report == null) return NotFound();
+
+            var workspaceId = report.WorkspaceId;
+            var ws = await _db.Workspaces.FindAsync(workspaceId);
+
+            try 
+            {
+                if (ws != null && !string.IsNullOrEmpty(ws.PowerBIWorkspaceId) && !string.IsNullOrEmpty(report.PowerBIReportId))
+                {
+                    await _service.DeleteReport(Guid.Parse(ws.PowerBIWorkspaceId), Guid.Parse(report.PowerBIReportId));
+                }
+                
+                _db.Reports.Remove(report);
+                await _db.SaveChangesAsync();
+                
+                return RedirectToAction("Index", new { workspaceId });
+            }
+            catch (Exception ex)
+            {
+                TempData["Error"] = "Delete Failed: " + ex.Message;
+                return RedirectToAction("Index", new { workspaceId });
+            }
         }
 
         [HttpGet]

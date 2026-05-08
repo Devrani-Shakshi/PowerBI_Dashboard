@@ -1,0 +1,66 @@
+========================================================================
+ALTERNATIVE STRATEGIES FOR RDL FILTERING
+========================================================================
+
+While our current "XML Injection & Re-upload" strategy is highly robust, 
+there are several other ways to achieve report filtering depending on 
+your infrastructure and report design.
+
+------------------------------------------------------------------------
+APPROACH 1: THE "RP:" URL INJECTION (The "Lightweight" Way)
+------------------------------------------------------------------------
+- Mechanism: Appending '&rp:FieldName=Value' to the Embed URL.
+- Requirement: The parameter 'FieldName' MUST already exist in the RDL.
+- Pros: 
+    - Instant (No re-upload needed).
+    - No XML manipulation.
+- Cons: 
+    - Fails if the parameter wasn't added by the report designer.
+- Verdict: Best for reports where parameters are pre-defined.
+
+------------------------------------------------------------------------
+APPROACH 2: SQL SESSION CONTEXT (The "Invisible" Way)
+------------------------------------------------------------------------
+- Mechanism: 
+    1. In the RDL SQL query, use: "SELECT * FROM Table WHERE Field = SESSION_CONTEXT(N'MyFilter')".
+    2. In your C# code, before rendering the report, run a SQL command: "EXEC sp_set_session_context 'MyFilter', 'Value'".
+- Pros: 
+    - ZERO changes to RDL XML once the query is set.
+    - Extremely secure.
+- Cons: 
+    - Requires modifying the SQL query in the RDL template once.
+    - Requires a persistent SQL connection.
+- Verdict: The "Gold Standard" for security and performance.
+
+------------------------------------------------------------------------
+APPROACH 3: SHARED DATASET (RSD) MODIFICATION
+------------------------------------------------------------------------
+- Mechanism: Instead of modifying the .rdl (Report), you modify the .rsd (Shared Dataset) file in the workspace.
+- Pros: 
+    - One change filters multiple reports.
+- Cons: 
+    - More complex API management.
+- Verdict: Best for enterprise environments with hundreds of reports.
+
+------------------------------------------------------------------------
+APPROACH 4: DAX FILTERING (For PBI Dataset Sources)
+------------------------------------------------------------------------
+- Mechanism: If your RDL uses a Power BI Dataset (not SQL) as a source, you can pass a DAX filter string in the Embed Token request.
+- Pros: 
+    - Very modern and supported by the official SDK.
+- Cons: 
+    - Only works if the report source is a Power BI Dataset.
+- Verdict: Use only if you are moving away from direct SQL connections.
+
+------------------------------------------------------------------------
+SUMMARY COMPARISON
+------------------------------------------------------------------------
+| Method | Complexity | Speed | XML Change? | Re-upload? |
+| :--- | :--- | :--- | :--- | :--- |
+| Current (XML Inject) | High | Medium | Yes | Yes |
+| URL (rp:) | Low | High | No | No |
+| SQL Context | Medium | High | One-time | No |
+| DAX Filter | Medium | High | No | No |
+
+**Recommendation**: If you want to avoid XML manipulation entirely, the **SQL Session Context (Approach 2)** is the best alternative. It allows you to filter data purely on the database side without ever touching the RDL file again!
+========================================================================

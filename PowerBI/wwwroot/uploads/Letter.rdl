@@ -282,6 +282,15 @@
           <DataField>Receipt</DataField>
         </Field>
       </Fields>
+      <Filters>
+        <Filter>
+          <FilterExpression>=Fields!Donor_Id.Value</FilterExpression>
+          <Operator>Equal</Operator>
+          <FilterValues>
+            <FilterValue>=Parameters!Donor_Id.Value</FilterValue>
+          </FilterValues>
+        </Filter>
+      </Filters>
     </DataSet>
     <DataSet Name="DonorNames">
       <Query>
@@ -1534,20 +1543,12 @@
         <cl:HideUpdateNotifications>true</cl:HideUpdateNotifications>
       </cl:ComponentMetadata>
     </ReportParameter>
+    <ReportParameter Name="Donor_Id">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <Prompt>Donor_Id</Prompt>
+    </ReportParameter>
   </ReportParameters>
-  <ReportParametersLayout>
-    <GridLayoutDefinition>
-      <NumberOfColumns>4</NumberOfColumns>
-      <NumberOfRows>2</NumberOfRows>
-      <CellDefinitions>
-        <CellDefinition>
-          <ColumnIndex>0</ColumnIndex>
-          <RowIndex>0</RowIndex>
-          <ParameterName>Donor</ParameterName>
-        </CellDefinition>
-      </CellDefinitions>
-    </GridLayoutDefinition>
-  </ReportParametersLayout>
   <CustomProperties>
     <CustomProperty>
       <Name>ReportGeneratorTemplate</Name>

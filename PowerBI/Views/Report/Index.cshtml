@@ -80,7 +80,10 @@
                             <td class="text-end pe-4">
                                 <div class="btn-group">
                                     <a asp-action="Preview" asp-route-reportId="@r.Id" class="btn btn-sm btn-outline-primary rounded-pill px-3 me-1">View</a>
-                                    <a asp-action="Export" asp-route-reportId="@r.Id" class="btn btn-sm btn-outline-secondary rounded-pill px-3">PDF</a>
+                                    <a asp-action="Export" asp-route-reportId="@r.Id" class="btn btn-sm btn-outline-secondary rounded-pill px-3 me-1">PDF</a>
+                                    <form asp-action="Delete" asp-route-reportId="@r.Id" method="post" onsubmit="return confirm('Are you sure you want to delete this report from Power BI?')">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger rounded-pill px-3">Delete</button>
+                                    </form>
                                 </div>
                             </td>
                         </tr>
@@ -172,6 +175,11 @@
                     <div class="mb-3">
                         <label class="form-label text-muted small">Select .pbix or .rdl file</label>
                         <input type="file" name="file" class="form-control bg-light border-light" required />
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-muted small">Target Filter Columns (RDL only)</label>
+                        <input type="text" name="targetFields" class="form-control bg-light border-light" placeholder="e.g. InvoiceId, Company, Item" />
+                        <div class="form-text extra-small mt-1">Comma-separated field names to automatically inject as filters.</div>
                     </div>
                     <div class="bg-light p-3 rounded-3 mb-3 border border-dashed">
                         <p class="small fw-bold mb-2">Samples:</p>

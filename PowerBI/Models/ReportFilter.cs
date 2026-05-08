@@ -19,5 +19,7 @@ namespace PowerBI.Models
         public string DisplayName { get; set; } = string.Empty;
         
         public bool IsActive { get; set; } = true;
+        
+        public bool IsCustom { get; set; } = false;
     }
 }
