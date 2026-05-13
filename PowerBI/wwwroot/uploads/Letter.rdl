@@ -282,15 +282,6 @@
           <DataField>Receipt</DataField>
         </Field>
       </Fields>
-      <Filters>
-        <Filter>
-          <FilterExpression>=Fields!Donor_Id.Value</FilterExpression>
-          <Operator>Equal</Operator>
-          <FilterValues>
-            <FilterValue>=Parameters!Donor_Id.Value</FilterValue>
-          </FilterValues>
-        </Filter>
-      </Filters>
     </DataSet>
     <DataSet Name="DonorNames">
       <Query>
@@ -1542,11 +1533,6 @@
       <cl:ComponentMetadata>
         <cl:HideUpdateNotifications>true</cl:HideUpdateNotifications>
       </cl:ComponentMetadata>
-    </ReportParameter>
-    <ReportParameter Name="Donor_Id">
-      <DataType>String</DataType>
-      <Nullable>true</Nullable>
-      <Prompt>Donor_Id</Prompt>
     </ReportParameter>
   </ReportParameters>
   <CustomProperties>

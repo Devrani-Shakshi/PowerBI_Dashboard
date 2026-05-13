@@ -21,5 +21,9 @@ namespace PowerBI.Models
         public bool IsActive { get; set; } = true;
         
         public bool IsCustom { get; set; } = false;
+
+        public bool IsStrict { get; set; } = false;
+        
+        public int? UserId { get; set; }
     }
 }

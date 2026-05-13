@@ -35,7 +35,9 @@ namespace PowerBI.Controllers
             }
 
             var workspaces = _db.Workspaces
-                .Where(w => w.UserId == userId)
+                .AsEnumerable()
+                .GroupBy(w => w.PowerBIWorkspaceId)
+                .Select(g => g.First())
                 .ToList();
 
             Console.WriteLine($"[WORKSPACE] Returning {workspaces.Count} synced workspaces.");

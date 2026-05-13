@@ -432,10 +432,24 @@
       </Fields>
       <Filters>
         <Filter>
-          <FilterExpression>=Fields!InvoiceId.Value</FilterExpression>
+          <FilterExpression>=LCase(Trim(CStr(Fields!Description.Value)))</FilterExpression>
           <Operator>Equal</Operator>
           <FilterValues>
-            <FilterValue>=Parameters!InvoiceId.Value</FilterValue>
+            <FilterValue>=LCase(Trim(IIf(CStr(Parameters!Description.Value) = "" OR CStr(Parameters!Description.Value) IS NOTHING OR CStr(Parameters!Description.Value) = "ALL", CStr(Fields!Description.Value), CStr(Parameters!Description.Value))))</FilterValue>
+          </FilterValues>
+        </Filter>
+        <Filter>
+          <FilterExpression>=LCase(Trim(CStr(Fields!Item.Value)))</FilterExpression>
+          <Operator>Equal</Operator>
+          <FilterValues>
+            <FilterValue>=LCase(Trim(IIf(CStr(Parameters!Item.Value) = "" OR CStr(Parameters!Item.Value) IS NOTHING OR CStr(Parameters!Item.Value) = "ALL", CStr(Fields!Item.Value), CStr(Parameters!Item.Value))))</FilterValue>
+          </FilterValues>
+        </Filter>
+        <Filter>
+          <FilterExpression>=Fields!Description.Value</FilterExpression>
+          <Operator>Equal</Operator>
+          <FilterValues>
+            <FilterValue>=IIf(Parameters!Description.Value = "" OR Parameters!Description.Value IS NOTHING OR Parameters!Description.Value = "ALL", Fields!Description.Value, Parameters!Description.Value)</FilterValue>
           </FilterValues>
         </Filter>
       </Filters>
@@ -3556,11 +3570,22 @@
       <cl:ComponentMetadata>
         <cl:HideUpdateNotifications>true</cl:HideUpdateNotifications>
       </cl:ComponentMetadata>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
     </ReportParameter>
-    <ReportParameter Name="InvoiceId">
+    <ReportParameter Name="Description">
       <DataType>String</DataType>
       <Nullable>true</Nullable>
-      <Prompt>InvoiceId</Prompt>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>Description</Prompt>
+      <Hidden>false</Hidden>
+    </ReportParameter>
+    <ReportParameter Name="Item">
+      <DataType>String</DataType>
+      <Nullable>true</Nullable>
+      <AllowBlank>true</AllowBlank>
+      <Prompt>Item</Prompt>
+      <Hidden>false</Hidden>
     </ReportParameter>
   </ReportParameters>
   <CustomProperties>

@@ -1,0 +1,336 @@
+# PROJECT_DECODED: Power BI Dashboard Integration
+
+## 1. Complete Flow (End-to-End Journey)
+
+### A. Authentication & Initialization
+- **Entry**: The application starts at `Program.cs`, which configures the services and seeds the database (Admin user and schema patches).
+- **User Entry**: Users land on the **Login Page** (`AuthController/Login`).
+- **Authorization**: Once logged in, users are redirected to the **Workspace List** (`WorkspaceController/Index`).
+
+### B. Data & Resource Management
+- **Workspace Sync**: Users can sync workspaces from their Power BI tenant. `WorkspaceController.Sync` calls `PowerBIService.SyncWorkspaces`, which fetches groups from the Power BI REST API and updates the local `AppDbContext`.
+- **Report & Folder Sync**: Within a workspace, `ReportController.Sync` triggers a deep sync. `PowerBIService.SyncReports` uses both the Power BI API and the **Fabric API** to discover reports, paginated reports (RDLs), and folders, preserving hierarchical structures in the local database.
+
+### C. Report Upload & RDL Engineering
+- **Upload**: Users upload `.pbix` or `.rdl` files via `ReportController.Upload`.
+- **RDL Injection (The "Secret Sauce")**: If an RDL is uploaded, `PowerBIService.NormalizeAndInjectRdl` intercepts the stream. It parses the RDL XML and injects custom parameters (like `TenantId`) and filter logic (`<Filters>` nodes) directly into the file before it ever hits Power BI. This ensures dynamic filtering works even for static "Enter Data" reports.
+- **Fabric Organization**: Reports are automatically moved into a designated Fabric folder (e.g., "Automated Reports") using the `MoveItemToFolder` service.
+
+### D. Interaction & Embedding
+- **Preview**: `ReportController.Preview` generates an **Embed Token** via `PowerBIService.GetEmbedConfig`. The frontend then uses the **Power BI JavaScript SDK** to render the report securely.
+- **Dynamic Filtering**: A sidebar discovers filterable fields via `PowerBIService.DiscoverReportFilters`. For PBIX, it uses DAX queries (`EVALUATE DISTINCT`) via `GetColumnValues`. For RDLs, it parses the XML or calls the parameters API.
+- **PDF Export**: Users can export reports with active filters. `ReportController.ExportWithFilters` calls `PowerBIService.ExportReportAsStream`, which handles the differing export configurations for standard vs. paginated reports.
+
+---
+
+## 2. Architecture Summary
+
+### Tech Stack
+- **Framework**: ASP.NET Core 9.0 (MVC)
+- **Database**: SQL Server with Entity Framework Core
+- **APIs**: Power BI REST API (v1.0), Microsoft Fabric API (v1)
+- **Identity**: Microsoft Identity Client (MSAL) for Service Principal authentication
+- **Frontend**: Razor Pages, Vanilla JavaScript, Power BI Client SDK
+
+### Folder Structure
+- `Controllers/`: Route handling and UI-to-Service orchestration.
+- `Services/`: 
+    - `PowerBIService`: The heavy lifter. Handles all API calls, RDL XML manipulation, and synchronization.
+    - `PowerBIAuthService`: Manages Azure AD (Entra ID) tokens for both Power BI and Fabric scopes.
+
+---
+
+## 3. Function Deep-Dive (Major Call Stack)
+
+### Core Operational Stack
+1.  **Entry Point**: `Program.cs` (Main)
+2.  **Sync Flow**:
+    - `WorkspaceController.Index` -> `PowerBIService.SyncWorkspaces`
+    - `ReportController.Index` -> `ReportController.GetReportsList` -> `PowerBIService.SyncReports`
+    - `PowerBIService.SyncReports` -> `PowerBIService.SyncFolders`
+3.  **Upload Flow**:
+    - `ReportController.Upload` -> `PowerBIService.UploadReport`
+    - `PowerBIService.UploadReport` -> `PowerBIService.NormalizeAndInjectRdl` (if RDL)
+    - `PowerBIService.NormalizeAndInjectRdl` -> `PowerBIService.ApplyInjectionToXDoc` (XML Manipulation)
+    - `PowerBIService.UploadReport` -> `PowerBIService.MoveItemToFolder` (Fabric API)
+4.  **Embedding Flow**:
+    - `ReportController.Preview` -> `PowerBIService.GetEmbedConfig`
+    - `PowerBIService.GetEmbedConfig` -> `PowerBIClient.Reports.GenerateTokenInGroupAsync`
+5.  **Filtering Flow**:
+    - `ReportController.GetFilterValues` -> `PowerBIService.GetColumnValues`
+    - `PowerBIService.GetColumnValues` -> `PowerBIClient.Datasets.ExecuteQueriesAsync` (DAX `DISTINCT`)
+6.  **Export Flow**:
+    - `ReportController.ExportWithFilters` -> `PowerBIService.ExportReportAsStream`
+    - `PowerBIService.ExportReportAsStream` -> `PowerBIClient.Reports.ExportToFileInGroupAsync`
+
+---
+
+## 4. Entry Point Details
+- **File**: `Program.cs`
+- **Logic**: 
+    - Initializes `WebApplicationBuilder`.
+    - Registers `PowerBIService` and `PowerBIAuthService` as Scoped services.
+    - Configures SQL Server connection.
+    - **Database Patching**: Contains inline SQL to manually check and create the `Folders` table and `IsCustom` columns, ensuring the database schema is always up-to-date with the latest feature releases without requiring complex migrations for every small change.
+    - **Default Route**: `{controller=Auth}/{action=Login}/{id?}`.
+
+---
+
+## 5. Dependency Tree & Setup (NuGet Breakdown)
+
+| Package | Version | Role in this Project |
+| :--- | :--- | :--- |
+| `Microsoft.EntityFrameworkCore.SqlServer` | 9.0.0 | **Data Persistence**: Enables the application to communicate with SQL Server, managing the state of users, workspaces, and reports. |
+| `Microsoft.EntityFrameworkCore.Tools` | 9.0.0 | **Infrastructure**: Provides CLI commands (e.g., `Add-Migration`, `Update-Database`) used during development to maintain the DB schema. |
+| `Microsoft.PowerBI.Api` | 4.19.0 | **Core Integration**: The official SDK for the Power BI REST API. Used for uploading reports, generating embed tokens, and triggering PDF exports. |
+| `Microsoft.Identity.Client` (MSAL) | 4.61.3 | **Identity Engine**: Handles Service Principal (App Registration) authentication with Entra ID to acquire Bearer tokens for API calls. |
+| `Microsoft.Rest.ClientRuntime` | 2.3.24 | **Plumbing**: A prerequisite for the Power BI SDK that manages underlying HTTP communication and response serialization. |
+
+---
+
+## 6. State Management (AppDbContext & DB Patching)
+
+### Table Relationships (Foreign Keys)
+- **Users**: Root entity.
+- **Workspaces**: Belongs to a **User** (`UserId`). Stores local metadata mapped to a Power BI Group ID.
+- **Folders**: Belongs to a **Workspace** (`WorkspaceId`). Maps to a Microsoft Fabric Folder ID.
+- **Reports**: Belongs to a **Workspace** (`WorkspaceId`) and optionally a **Folder** (`FolderId`). Tracks whether the report is a standard PBIX or a Paginated RDL.
+- **ReportFilters**: Belongs to a **Report** (`ReportId`). Stores discovered fields (PBIX) or parameters (RDL) used for the dynamic sidebar.
+
+### Database Patching Logic (Program.cs)
+Instead of traditional migrations, the project uses **Inline Schema Discovery** during startup to ensure environment stability:
+1.  **Folders Table**: Checks `sys.objects` for `Folders`. If missing, it executes `CREATE TABLE` with `FabricFolderId` to support the Fabric integration.
+2.  **Report.FolderId**: Checks `sys.columns` for `FolderId` on the `Reports` table. If missing, it runs `ALTER TABLE ... ADD` to enable folder-level organization.
+3.  **ReportFilters.IsCustom**: Adds an `IsCustom` bit column to track manually added parameters, ensuring they aren't purged during a "Smart Scan" or discovery reset.
+
+---
+
+## 7. The RDL Injection Logic (Surgical Breakdown)
+
+The `NormalizeAndInjectRdl` function is the core of the project's RDL interoperability. It modifies the XML structure of the `.rdl` file in memory before uploading.
+
+### Step-by-Step Logic:
+1.  **Pre-Scan**: It searches all `<DataSet>` nodes. If a dataset is SQL-based (`DataProvider` contains "SQL"), it flags it for SQL injection. If it's static (ENTERDATA), it checks the `<Fields>` collection.
+2.  **Parameter Injection**:
+    - Targets the `<ReportParameters>` node.
+    - If missing, it adds a new `<ReportParameter Name="paramName">` element.
+    - Specifically sets `<DataType>String</DataType>`, `<Nullable>true</Nullable>`, and a `<Prompt>`.
+3.  **DataSet Injection**:
+    - **SQL Injection**: For SQL datasets, it performs a string replace on `<CommandText>`. It injects `WHERE Column = @Column` logic, handling existing WHERE clauses or ORDER BY statements via regex-like string manipulation.
+    - **Filter Injection**: For static datasets, it injects a `<Filter>` node into the `<DataSet>`. It targets the `<Filters>` collection (creating it if missing) and adds a `<FilterExpression>` linked to the parameter: `=Parameters!paramName.Value`.
+4.  **Layout Reset**: It explicitly removes the `<ReportParametersLayout>` node. This forces the Power BI service to "re-discover" the parameters and build a fresh UI layout, preventing rendering errors caused by stale XML layout coordinates.
+
+---
+
+## 8. Security & Auth Flow (Token Trace)
+
+The `PowerBIAuthService` acts as the gatekeeper for all external communication.
+
+### Trace:
+1.  **Trigger**: A service method (e.g., `GetEmbedConfig`) calls `_auth.GetAccessToken()`.
+2.  **Authentication**: Uses **ConfidentialClientApplication** (Service Principal).
+    - **ClientId/Secret**: Fetched from `appsettings.json`.
+    - **Authority**: `https://login.microsoftonline.com/{tenantId}`.
+3.  **Scopes**:
+    - **Power BI API**: Requests `https://analysis.windows.net/powerbi/api/.default`. This grants access to `Reports.ReadWrite.All`, `Workspace.ReadWrite.All`, etc.
+    - **Fabric API**: Requests `https://api.fabric.microsoft.com/.default`. This is used specifically for Folder management and the "recursive" item discovery needed for folder synchronization.
+
+---
+
+## 9. Step-by-Step Execution Trace: "Export to PDF"
+
+1.  **UI**: User selects filter values (e.g., "Region: North") and clicks **"Export PDF"** in `Preview.cshtml`.
+2.  **JS**: The `exportToPdf()` function collects `activeFilters`, converts them to a OData-style filter string, and sends a POST request to `/Report/ExportWithFilters`.
+3.  **Controller**: `ReportController.ExportWithFilters` receives the report ID and filter list.
+4.  **Service**: `PowerBIService.ExportReportAsStream` is invoked.
+    - **Configuration**: If RDL, it maps the filters to `ParameterValues`. If PBIX, it maps them to `ReportLevelFilters`.
+    - **Trigger**: Calls `ExportToFileInGroupAsync`.
+5.  **Polling**: The service enters a `do-while` loop, calling `GetExportToFileStatusInGroupAsync` every 3 seconds until the status is `Succeeded`.
+6.  **Download**: Once successful, it calls `GetFileOfExportToFileInGroupAsync` to retrieve the binary stream.
+7.  **Return**: The `ReportController` takes the stream and returns a `FileResult` (MIME: `application/pdf`) back to the browser, triggering a download.
+
+---
+
+## 10. Function Dictionary
+
+### ReportController
+| Method | Params | Return | Logic |
+| :--- | :--- | :--- | :--- |
+| `Index` | `workspaceId` | `View` | Entry point for report list. Calls `GetReportsList`. |
+| `Sync` | `workspaceId` | `Redirect` | Forces refresh of reports/folders from API. |
+| `Upload` | `file, workspaceId, ...` | `Redirect` | Handles multipart file upload and triggers `PowerBIService.UploadReport`. |
+| `Preview` | `reportId` | `View` | Prepares embedding metadata. Calls `GetEmbedConfig`. |
+| `ResetFilters` | `reportId` | `Json` | Purges local filter metadata and restarts discovery via API/XML. |
+| `SaveCustomFilter`| `Request` | `Ok/Error` | Injects filters into RDLs and re-uploads them. |
+| `GetFilterValues` | `datasetId, table, ...` | `Json` | Fetches distinct values for the sidebar via DAX or API. |
+
+### PowerBIService
+| Method | Params | Return | Logic |
+| :--- | :--- | :--- | :--- |
+| `GetOrCreateWorkspace`| `name` | `Group` | Ensures a workspace exists in PBI and is assigned to a Capacity. |
+| `SyncReports` | `localWs, pbiWs, db` | `Task` | Uses Fabric recursive scan to sync reports and folder hierarchy. |
+| `UploadReport` | `file, ws, ...` | `Import` | Core upload logic. Triggers RDL injection if applicable. |
+| `ApplyInjectionToXDoc`| `xDoc, param` | `void` | **Private**: Manipulates RDL XML to add params and filter logic. |
+| `ExportReportAsStream`| `wsId, repId, filters`| `Stream` | Orchestrates async PDF export and status polling. |
+| `DiscoverReportFilters`| `repId, dsId, db` | `Task` | Scans PBI tables or parses RDL XML for queryable fields. |
+| `GetColumnValues` | `dsId, table, col` | `List<string>`| Executes DAX `EVALUATE DISTINCT` on PBI datasets. |
+| `GetOrCreateFolder` | `wsId, name, db` | `int` | Uses Fabric API to manage workspace folders. |
+
+---
+
+## 11. Advanced Integration Details
+
+### A. Fabric API vs. Power BI API (The Hybrid Approach)
+The project utilizes a hybrid API strategy to overcome limitations in the standard Power BI REST API:
+- **Power BI API (v1.0)**: Used for core embedding, token generation, and report-level operations (Export, Upload).
+- **Fabric API (v1)**: Used for **Folder Hierarchy**. The standard PBI API does not natively return folder paths for items. By calling `workspaces/{id}/items?recursive=true`, the system retrieves the `parentFolderId`, allowing it to reconstruct the exact organizational structure of the workspace within the local database.
+
+### B. DAX Engine for Dynamic Filters
+For Power BI reports (.pbix), the system doesn't rely on static lists. When a user expands a filter category in the sidebar, `PowerBIService.GetColumnValues` executes a raw DAX query:
+- **Query**: `EVALUATE DISTINCT('TableName'[ColumnName])`
+- **Execution**: The query is sent via `client.Datasets.ExecuteQueriesAsync`.
+- **Why?**: This ensures that the filter values are always real-time and reflect the actual data currently present in the dataset, including any security filters applied to the Service Principal.
+
+### C. The "Smart Scan" (Visual Discovery)
+In `Preview.cshtml`, the **Smart Scan** feature solves the "API restricted" problem. If the Service Principal lacks permissions to scan the full dataset schema:
+1.  It iterates through every page of the embedded report.
+2.  It drills into each visual (Chart, Table, Map).
+3.  It calls `visual.getFilters()` via the Power BI JS SDK.
+4.  It extracts the `table` and `column` names from active visuals and adds them to the sidebar discovery list.
+
+### D. RDL "Layout Reset" & Parameter Synchronization
+A unique challenge with RDL injection is the `<ReportParametersLayout>` tag. 
+- **The Problem**: RDLs store fixed X/Y coordinates for parameter prompts. If you inject a new parameter but leave the old layout XML, the report often fails to render or hides the new parameter.
+- **The Solution**: `PowerBIService` explicitly deletes the entire layout node. This forces the Power BI Paginated Report engine to auto-generate a fresh layout, ensuring all injected parameters (like `TenantId`) are active and correctly mapped in the background.
+
+---
+
+## 12. Troubleshooting & Error Code Dictionary
+
+| Error Code | Context | Real-World Meaning |
+| :--- | :--- | :--- |
+| `403 Forbidden` | Export/Sync | Usually means the Service Principal is not an **Admin/Member** of the workspace, or "Export to File" is disabled in the Power BI Tenant settings. |
+| `RequestedFileIsEncryptedOrCorrupted`| Upload | Occurs if uploading an RDL to a workspace that is **not** on a Premium/Fabric capacity. |
+| `401 Unauthorized` | Auth Flow | The Client Secret has expired or the Tenant ID in `appsettings.json` is incorrect. |
+| `404 Not Found` | Sync/Delete | The report or workspace was deleted directly in the Power BI portal but is still present in the local database. |
+
+---
+
+## 13. System Security: Row Level Security (RLS) Simulation
+While PBIX uses native RLS, this project implements **Manual RLS for Paginated Reports (RDL)**:
+1.  Every RDL is injected with a mandatory `TenantId` parameter.
+2.  The SQL queries within the RDL are modified to include `WHERE TenantId = @TenantId`.
+3.  During **Export** or **Preview**, the system hardcodes the `TenantId` (e.g., `PROD-TENANT-001`) in the background.
+4.  **Security Result**: The user can never see or change the `TenantId` filter in the UI, but it is applied to every data request, ensuring data isolation.
+
+---
+
+## 14. Detailed Code Walkthrough: PowerBIService.cs
+
+### A. Initialization & Client Setup (Lines 1-37)
+- **Namespace & Imports**: Includes `Microsoft.PowerBI.Api` for PBI interactions and `System.Xml.Linq` for the RDL engine.
+- **Constructor**: Injects `PowerBIAuthService` to handle token lifecycle.
+- **GetClient()**:
+    - Calls `_auth.GetAccessToken()` to get the Bearer token.
+    - Initializes `TokenCredentials`.
+    - Returns a `PowerBIClient` targeting `https://api.powerbi.com/`.
+
+### B. Workspace Lifecycle (Lines 39-187)
+- **GetOrCreateWorkspace(name)**:
+    - Lists all groups (`client.Groups.GetGroupsAsync`).
+    - If found, returns the `existingGroup`.
+    - If not, calls `CreateGroupAsync`.
+    - **Capacity Assignment**: Crucial step. Calls `AssignToCapacityAsync` using a GUID from settings. Without this, exports and large uploads fail.
+    - **Admin Grant**: Immediately adds the configured Admin Email as a "Member/Admin" to ensure the dev team has visibility in the portal.
+- **SyncWorkspaces(userId, db)**:
+    - Compares PBI Cloud state with local `AppDbContext`.
+    - **Add/Update**: Adds new workspaces or updates names if they changed in the portal.
+    - **Cleanup**: Removes local records if the workspace was deleted in Power BI.
+
+### C. Fabric Hierarchy Engine (Lines 192-377)
+- **SyncFolders**:
+    - Switches to **Fabric Token** (`_auth.GetFabricToken`).
+    - Hits `folders` endpoint.
+    - Maps `FabricFolderId` to local `Folder` entity.
+- **SyncReports**:
+    - **Recursive Scan**: Hits `items?recursive=true`. This is the *only* way to get the `parentFolderId` for reports nested in folders.
+    - **DB Reconciliation**: Updates the `FolderId` column on the `Report` table so the UI can show the correct hierarchy.
+
+### D. The Upload & Injection Pipeline (Lines 379-552)
+- **Extension Check**: Blocks `.pbit` (templates) as they aren't queryable via API.
+- **NormalizeAndInjectRdl**: 
+    - If `.rdl`, it runs the XML engine.
+    - Saves a copy to `wwwroot/uploads` for local metadata scanning.
+- **PostImportWithFileAsync**: Sends the stream to PBI.
+- **Status Polling**: Enters a loop (`while (import.ImportState != "Succeeded")`) with a 2-second delay.
+- **Fabric Move**: After a successful upload, reports land in "My Workspace" root. The service waits, finds the new Report ID, and calls `MoveItemToFolder` to relocate it to the target Fabric folder.
+
+### E. RDL XML Engine (Lines 554-740)
+- **ApplyInjectionToXDoc**:
+    - **Pre-Scan**: Checks if the parameter name exists in the dataset schema. This prevents "Orphan Parameters" that block report rendering.
+    - **XDocument Manipulation**:
+        - Injects `<ReportParameter>` into the parameters collection.
+        - **SQL Parsing**: If it's a SQL dataset, it uses string replacement to inject `@param` into the `WHERE` clause.
+        - **Static Filters**: If it's "Enter Data", it adds a `<Filter>` node instead.
+    - **Layout Removal**: Deletes `<ReportParametersLayout>` to force a UI reset in the browser.
+
+### F. Export & Rendering (Lines 744-841)
+- **ExportReportAsStream**:
+    - **Hybrid Logic**: If RDL, it maps UI filters to `ParameterValue` objects. If PBIX, it uses `ReportLevelFilters`.
+    - **Background Security**: Automatically appends `TenantId` if the report schema supports it, ensuring data isolation in the exported PDF.
+    - **Status Loop**: Polls `GetExportToFileStatusInGroupAsync` every 3 seconds.
+- **GetEmbedConfig**: Generates an **Embed Token** with `accessLevel: "view"`.
+
+### G. Schema Discovery & DAX (Lines 844-1179)
+- **DiscoverReportFilters**:
+    - **RDL**: First tries the API. If the API doesn't return parameters, it falls back to parsing the local XML file in `wwwroot/uploads`.
+    - **PBIX**: Hits the `datasets/{id}/tables` endpoint to list all columns.
+- **GetColumnValues**:
+    - **DAX Injection**: Constructs `EVALUATE DISTINCT('Table'[Column])`.
+    - **Execution**: Sends to `ExecuteQueriesAsync`.
+    - **RDL Fallback**: If it's an RDL, it tries to read "Suggested Values" from the RDL definition or the API.
+
+### H. Fabric Utilities (Lines 1182-1326)
+- **GetOrCreateFolder**: Uses the Fabric API (`POST folders`) to create a directory if it doesn't exist.
+- **MoveItemToFolder**: Uses the Fabric `/move` endpoint to reorganize reports.
+- **DeleteReport**: Simple wrapper for `DeleteReportInGroupAsync`.
+
+---
+
+## 15. Database Schema & Rationale
+
+### A. Entity Relationship Diagram (ERD) Logic
+The database is designed to act as a **Metadata Proxy** between the web application and the Power BI/Fabric Cloud APIs.
+
+| Entity | Primary Key | Foreign Keys | Relationship |
+| :--- | :--- | :--- | :--- |
+| **Users** | `Id` | - | Root |
+| **Workspaces**| `Id` | `UserId` | 1 User : Many Workspaces |
+| **Folders** | `Id` | `WorkspaceId` | 1 Workspace : Many Folders |
+| **Reports** | `Id` | `WorkspaceId`, `FolderId`| 1 Workspace : Many Reports |
+| **ReportFilters**| `Id` | `ReportId` | 1 Report : Many Filters |
+
+### B. The "Why" Behind Each Table
+
+#### 1. Workspaces Table
+- **Rationale**: We store workspaces locally to map **Internal Users** to **Power BI Groups**. 
+- **Efficiency**: Fetching workspaces from the PBI API on every page load causes significant latency. Caching them allows for instant navigation.
+- **Identity**: It ensures that a user only sees the Power BI workspaces they are authorized to manage within this specific portal.
+
+#### 2. Folders Table (The Fabric Bridge)
+- **Rationale**: The standard Power BI API does not provide a hierarchical folder structure for reports. 
+- **The "Fabric Problem"**: While Fabric supports folders, browsing them requires complex recursive API calls. We store them locally to provide a **Windows Explorer-like** UI for report organization without the overhead of real-time recursive discovery.
+
+#### 3. Reports Table
+- **Rationale**: This is the "Identity Card" for each report.
+- **Type Tracking**: Standard reports (.pbix) and Paginated reports (.rdl) use completely different APIs for almost everything (Export, Token Gen, Filtering). Storing the `ReportType` allows the application to branch its logic instantly.
+- **Metadata Storage**: Storing the `PowerBIReportId` and `PowerBIDatasetId` is mandatory to generate embed tokens without extra discovery steps.
+
+#### 4. ReportFilters Table (The Discovery Cache)
+- **Rationale**: This is the most critical table for performance. 
+- **The Performance Problem**: Determining which fields are available to filter in a report requires either running DAX queries (slow) or parsing massive XML files (for RDLs). 
+- **Sidebar Efficiency**: By caching these fields, the **Filter Sidebar** in the Preview page loads in milliseconds. 
+- **Custom Logic**: The `IsCustom` flag allows the system to distinguish between fields found in the report and fields **Manually Injected** by the user for advanced RLS or parameter scenarios.
+
+#### 5. Users Table
+- **Rationale**: Provides application-level security and session management. It ensures that the Service Principal (which has global access) is only used on behalf of authenticated portal users.

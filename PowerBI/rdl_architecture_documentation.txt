@@ -1,0 +1,32 @@
+RDL GATEWAY & CUSTOM FILTER ARCHITECTURE
+========================================
+
+This document explains the end-to-end working of the RDL Custom Filter system.
+
+1. DATA FLOW
+-----------
+A. DATABASE: We store the RDL XML in [Reports].[RdlContent]. Parameters are discovered and stored in [Filters].
+B. BACKEND: PowerBIService.cs performs 3 key steps:
+   1. Patching: Changes connection strings in XML to match the Gateway server.
+   2. Binding: Tells Power BI API to connect the Report ID to the Gateway ID.
+   3. Token: Generates a V2 Embed Token specifically for Paginated Reports (No Dataset ID).
+C. FRONTEND: Preview.cshtml handles rendering:
+   1. Initialization: Resets the viewer and forces '/rdlEmbed' routing.
+   2. Filtering: applySidebarFilters() appends '&rp:Param=Value' to the URL.
+
+2. KEY FUNCTIONS
+---------------
+- AttemptAutoGatewayBinding(): Connects the RDL report to your local SQL Gateway.
+- applySidebarFilters(): Updates the report view using URL-based parameter injection.
+- SyncReports(): Keeps the Fabric cloud and local DB in sync.
+
+3. PERMISSIONS REQUIRED
+----------------------
+- Service Principal must be ADMIN of the Workspace.
+- Service Principal must be a USER of the Gateway Datasource (in Power BI portal).
+
+4. COMMON ERRORS & FIXES
+-----------------------
+- 403 Forbidden: Remove 'datasetId' from the token request.
+- Gateway Error: Database name casing must match EXACTLY (e.g., 'powerBIdemo').
+- Spinner: Ensure 'type' is set to 'report' and 'tokenType' is 1.

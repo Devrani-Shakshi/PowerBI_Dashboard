@@ -12,16 +12,19 @@ using Microsoft.EntityFrameworkCore;
 using System.Xml;
 using System.Xml.Linq;
 using System.IO;
+using Microsoft.Extensions.Configuration;
 
 namespace PowerBI.Services
 {
     public class PowerBIService
     {
         private readonly PowerBIAuthService _auth;
+        private readonly IConfiguration _config;
 
-        public PowerBIService(PowerBIAuthService auth)
+        public PowerBIService(PowerBIAuthService auth, IConfiguration config)
         {
             _auth = auth;
+            _config = config;
         }
 
         private async Task<PowerBIClient> GetClient()
@@ -36,7 +39,62 @@ namespace PowerBI.Services
             return new PowerBIClient(new Uri("https://api.powerbi.com/"), credentials);
         }
 
-        // Get or Create Workspace
+        // --- SINGLE REPORT ARCHITECTURE: RDL SCHEMA DISCOVERY ---
+        public async Task<(bool Exists, string Detail)> ValidateFieldExistsInRdl(int reportId, string fieldName, AppDbContext db)
+        {
+            var report = await db.Reports.FindAsync(reportId);
+            if (report == null) return (false, "Report not found in database.");
+
+            var reportName = report.Name ?? "Unknown";
+            var fileName = reportName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? reportName : $"{reportName}.rdl";
+            var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fileName);
+
+            if (!File.Exists(filePath)) return (false, $"Original RDL file '{fileName}' missing from server uploads.");
+
+            try
+            {
+                XDocument xDoc = XDocument.Load(filePath);
+                var ns = xDoc.Root?.GetDefaultNamespace() ?? XNamespace.None;
+
+                // 1. Check Report Parameters
+                var hasParam = xDoc.Descendants(ns + "ReportParameter")
+                                   .Any(p => p.Attribute("Name")?.Value.Equals(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+                if (hasParam) return (true, "Found in Report Parameters");
+
+                // 2. Check Dataset Fields
+                var hasField = xDoc.Descendants(ns + "Field")
+                                   .Any(f => f.Attribute("Name")?.Value.Equals(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+                if (hasField) return (true, "Found in Dataset Fields");
+
+                // 3. Check Dataset Query Parameters
+                var hasQueryParam = xDoc.Descendants(ns + "QueryParameter")
+                                        .Any(q => q.Attribute("Name")?.Value.Replace("@", "").Equals(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+                if (hasQueryParam) return (true, "Found in Dataset Query Parameters");
+
+                // 3. CRITICAL: Wipe the Layout Grid (Industry Level Workaround)
+                // Deleting the layout section forces Power BI to re-generate a perfect layout for all parameters.
+                // This prevents 'rsInvalidParameterLayoutCellDefNotEqualsParameterCount' and 'rsInvalidParameterLayoutParametersMissingFromPanel' errors.
+                var layout = xDoc.Descendants(ns + "ReportParametersLayout").FirstOrDefault();
+                if (layout != null)
+                {
+                    layout.Remove();
+                    Console.WriteLine(">>>> [LAYOUT] Removed fixed grid layout to force dynamic re-generation.");
+                }
+
+                // 4. SAVE WITH BOM (Power BI Requirement)
+                var utf8WithBom = new System.Text.UTF8Encoding(true);
+                using (var sw = new StreamWriter(filePath, false, utf8WithBom))
+                {
+                    xDoc.Save(sw);
+                }
+
+                return (false, $"Field '{fieldName}' not found in RDL schema. Note: For RDL reports, you can only filter by fields that are defined as Report Parameters.");
+            }
+            catch (Exception ex)
+            {
+                return (false, $"Error parsing RDL: {ex.Message}");
+            }
+        }
         public async Task<Microsoft.PowerBI.Api.Models.Group> GetOrCreateWorkspace(string name)
         {
             try 
@@ -109,9 +167,8 @@ namespace PowerBI.Services
                 var pbiGroups = await client.Groups.GetGroupsAsync();
                 var pbiWorkspaces = pbiGroups.Value;
 
-                var localWorkspaces = db.Workspaces.Where(w => w.UserId == userId).ToList();
-
-
+                var localWorkspaces = db.Workspaces.ToList();
+                
                 var adminEmail = _auth.GetAdminEmail();
                 foreach (var pbiWs in pbiWorkspaces)
                 {
@@ -128,7 +185,7 @@ namespace PowerBI.Services
                         }
                         catch { }
                     }
-
+                    
                     var existing = localWorkspaces.FirstOrDefault(w => w.PowerBIWorkspaceId == pbiWs.Id.ToString());
                     if (existing == null)
                     {
@@ -257,10 +314,16 @@ namespace PowerBI.Services
             }
         }
 
-        public async Task SyncReports(int localWorkspaceId, Guid pbiWorkspaceId, AppDbContext db)
+        public async Task SyncReports(IEnumerable<int> localWorkspaceIds, AppDbContext db)
         {
-            try 
+            var processedPbiIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var localWorkspaceId in localWorkspaceIds)
             {
+                var workspace = await db.Workspaces.FindAsync(localWorkspaceId);
+                if (workspace == null || string.IsNullOrEmpty(workspace.PowerBIWorkspaceId)) continue;
+                Guid pbiWorkspaceId;
+                if (!Guid.TryParse(workspace.PowerBIWorkspaceId, out pbiWorkspaceId)) continue;
+
                 // 1. Sync Folders First
                 await SyncFolders(localWorkspaceId, pbiWorkspaceId, db);
 
@@ -285,46 +348,84 @@ namespace PowerBI.Services
                 var itemsRoot = JsonConvert.DeserializeObject<dynamic>(itemsJson);
                 var fabricItems = itemsRoot?.value;
 
-                var localReports = db.Reports.Where(r => r.WorkspaceId == localWorkspaceId).ToList();
                 var localFolders = db.Folders.Where(f => f.WorkspaceId == localWorkspaceId).ToList();
+                var localReports = db.Reports.Where(r => r.WorkspaceId == localWorkspaceId).ToList();
+                var syncedReportIds = new HashSet<string>();
 
                 // 3. Process every item found by Fabric
-                var syncedReportIds = new List<string>();
                 if (fabricItems != null)
                 {
                     foreach (var item in fabricItems)
                     {
                         string type = item.type?.ToString() ?? "";
                         string displayName = item.displayName?.ToString() ?? "Unknown";
-                        Console.WriteLine($"[SYNC] Found Fabric Item: {displayName} (Type: {type})");
-
-                        if (type != "Report" && type != "PaginatedReport") continue;
-
                         string pbiId = item.id.ToString();
                         string? parentFolderId = item.parentFolderId?.ToString();
                         
+                        if (processedPbiIds.Contains(pbiId)) 
+                        {
+                            Console.WriteLine($"[SYNC] Skipping already processed report: {pbiId}");
+                            continue;
+                        }
+                        processedPbiIds.Add(pbiId);
                         syncedReportIds.Add(pbiId);
-                        
+
                         // Try to find datasetId from pbiReports list
                         var pbiMatch = pbiReports.FirstOrDefault(p => p.Id.ToString().Equals(pbiId, StringComparison.OrdinalIgnoreCase));
                         string? datasetId = pbiMatch?.DatasetId;
 
+                        Console.WriteLine($"[SYNC] Found Fabric Item: {displayName} (Type: {type}) (Dataset: {datasetId ?? "NULL"})");
+
+                        if (type != "Report" && type != "PaginatedReport") continue;
+
                         int? localFolderId = null;
-                        if (!string.IsNullOrEmpty(parentFolderId))
+                        if (!string.IsNullOrEmpty(parentFolderId) && localFolders != null)
                         {
-                            var folderMatch = localFolders.FirstOrDefault(f => f.FabricFolderId.Equals(parentFolderId, StringComparison.OrdinalIgnoreCase));
+                            var folderMatch = localFolders.FirstOrDefault(f => f.FabricFolderId != null && f.FabricFolderId.Equals(parentFolderId, StringComparison.OrdinalIgnoreCase));
                             localFolderId = folderMatch?.Id;
                             if (localFolderId.HasValue)
                                 Console.WriteLine($"[SYNC] Report '{displayName}' belongs to Folder '{folderMatch?.Name}'");
                         }
 
-                        var existing = localReports.FirstOrDefault(r => r.PowerBIReportId.Equals(pbiId, StringComparison.OrdinalIgnoreCase));
+                        string normalizedDisplayName = displayName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                        
+                        // 1. Try exact match by PowerBI ID
+                        var existing = localReports.FirstOrDefault(r => (r.PowerBIReportId ?? "").Equals(pbiId, StringComparison.OrdinalIgnoreCase));
+
+                        // 2. Fallback: Match by Name + Workspace (Only if the local report's current ID is missing or invalid)
                         if (existing == null)
                         {
-                            Console.WriteLine($"[SERVICE] Adding new {type} to DB: {displayName} (Folder: {localFolderId})");
+                            // Check if the local record already has a valid ID that we haven't processed yet
+                            var strayReport = localReports.FirstOrDefault(r => 
+                                r.Name != null && r.Name.Equals(normalizedDisplayName, StringComparison.OrdinalIgnoreCase) && 
+                                r.WorkspaceId == localWorkspaceId);
+
+                            if (strayReport != null)
+                            {
+                                // CRITICAL: If the local record already has a valid ID that exists in Fabric,
+                                // we MUST NOT overwrite it with a name-based duplicate.
+                                bool currentIdStillExists = fabricItems != null && ((IEnumerable<dynamic>)fabricItems).Any(i => i.id != null && i.id.ToString().Equals(strayReport.PowerBIReportId ?? "", StringComparison.OrdinalIgnoreCase));
+                                
+                                if (!currentIdStillExists)
+                                {
+                                    Console.WriteLine($"[SYNC] ID Drift detected for '{strayReport.Name}'. Updating to latest ID: {pbiId}");
+                                    strayReport.PowerBIReportId = pbiId;
+                                    existing = strayReport;
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"[SYNC] Skipping duplicate Fabric item '{displayName}' (ID: {pbiId}) because local report '{strayReport.Name}' is already synced to a valid ID ({strayReport.PowerBIReportId}).");
+                                    continue; // Skip this fabric item, it's a redundant duplicate
+                                }
+                            }
+                        }
+
+                        if (existing == null)
+                        {
+                            Console.WriteLine($"[SERVICE] Adding new {type} to DB: {normalizedDisplayName} (Folder: {localFolderId})");
                             db.Reports.Add(new PowerBI.Models.Report
                             {
-                                Name = displayName,
+                                Name = normalizedDisplayName,
                                 PowerBIReportId = pbiId,
                                 PowerBIDatasetId = datasetId,
                                 WorkspaceId = localWorkspaceId,
@@ -334,7 +435,8 @@ namespace PowerBI.Services
                         }
                         else
                         {
-                            if (existing.Name != displayName) existing.Name = displayName;
+                            normalizedDisplayName = displayName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                            if (existing.Name != normalizedDisplayName) existing.Name = normalizedDisplayName;
                             
                             // Only update folder if we found one in Fabric (prevents "un-moving" if API is slow)
                             if (localFolderId.HasValue) 
@@ -342,20 +444,29 @@ namespace PowerBI.Services
                                 existing.FolderId = localFolderId;
                             }
                             
-                            if (datasetId != null) existing.PowerBIDatasetId = datasetId;
+                            // CRITICAL FIX: Ensure DatasetId is saved for RDLs to avoid token failures
+                            if (!string.IsNullOrEmpty(datasetId)) 
+                            {
+                                existing.PowerBIDatasetId = datasetId;
+                            }
+                            else if (existing.ReportType == "RDL")
+                            {
+                                // If DatasetId is missing from the report object, try to find the shadow dataset
+                                var dsMatch = pbiReports.FirstOrDefault(p => p.Name == displayName || p.Name == displayName + ".rdl");
+                                if (dsMatch != null) existing.PowerBIDatasetId = dsMatch.DatasetId;
+                            }
+
                             existing.ReportType = type == "PaginatedReport" ? "RDL" : "PowerBI";
                         }
                     }
                 }
 
                 // 4. Cleanup: Remove local reports that no longer exist in Fabric
-                // SAFETY: Only delete if we actually successfully synced some reports. 
-                // If syncedReportIds is empty, the Fabric API might be lagging or having a transient issue.
                 if (syncedReportIds.Any())
                 {
                     foreach (var localRep in localReports)
                     {
-                        if (!syncedReportIds.Contains(localRep.PowerBIReportId))
+                        if (localRep.PowerBIReportId != null && !syncedReportIds.Contains(localRep.PowerBIReportId))
                         {
                             Console.WriteLine($"[SERVICE] Removing report from DB (deleted in PBI): {localRep.Name}");
                             db.Reports.Remove(localRep);
@@ -368,15 +479,50 @@ namespace PowerBI.Services
                 }
 
                 await db.SaveChangesAsync();
-            }
-            catch (HttpOperationException ex)
-            {
-                Console.WriteLine($"[SERVICE] Power BI API Error during SyncReports: {ex.Response.Content}");
-                throw new Exception($"Power BI API Error: {ex.Response.ReasonPhrase}. Details: {ex.Response.Content}");
-            }
-        }
 
-        public async Task<Import> UploadReport(int localWorkspaceId, Guid pbiWorkspaceId, string name, Stream stream, AppDbContext db, string? folderName = null, List<string>? customParams = null)
+                // 5. AUTO-CLEANUP: If we have multiple reports with the same name in Fabric, cleanup the duplicates
+                try {
+                    if (fabricItems != null)
+                    {
+                        var itemsList = ((IEnumerable<dynamic>)fabricItems).ToList();
+                        var duplicateGroups = itemsList
+                            .Where(i => (string)(i.type?.ToString() ?? "") == "PaginatedReport" || (string)(i.type?.ToString() ?? "") == "Report")
+                            .GroupBy(i => (string)(i.displayName?.ToString() ?? "Unknown"))
+                            .Where(g => g.Count() > 1);
+
+                        foreach (var group in duplicateGroups)
+                        {
+                            string reportName = group.Key; // Explicitly cast to string
+                            string normalizedName = reportName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+
+                            // Keep the one that is currently in our DB, delete others from Fabric
+                            var masterRep = db.Reports.FirstOrDefault(r => r.WorkspaceId == localWorkspaceId && r.Name == normalizedName);
+                            
+                            if (masterRep != null)
+                            {
+                                foreach (var item in group)
+                                {
+                                    string pbiId = item.id.ToString();
+                                    if (pbiId != masterRep.PowerBIReportId)
+                                    {
+                                        Console.WriteLine($"[AUTO-CLEANUP] Deleting redundant duplicate from Fabric: {reportName} (ID: {pbiId})");
+                                        await DeleteReport(pbiWorkspaceId, Guid.Parse(pbiId));
+                                        
+                                        // CRITICAL: Also remove from local DB so user doesn't click a dead link
+                                        var staleRep = db.Reports.FirstOrDefault(r => r.PowerBIReportId == pbiId);
+                                        if (staleRep != null) db.Reports.Remove(staleRep);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ex) {
+                    Console.WriteLine($"[AUTO-CLEANUP] Warning: {ex.Message}");
+                }
+            } // End of Workspace Loop
+        } // End of SyncReports Method
+
+        public async Task<(Import Import, string? RdlContent)> UploadReport(int localWorkspaceId, Guid pbiWorkspaceId, string name, Stream stream, AppDbContext db, string? folderName = null, List<string>? customParams = null)
         {
             try 
             {
@@ -401,7 +547,27 @@ namespace PowerBI.Services
 
                 var targetFolder = string.IsNullOrEmpty(folderName) ? "Automated Reports" : folderName;
 
-                // RDL usually prefers 'Abort' or 'Ignore', PBIX prefers 'CreateOrOverwrite'
+                // --- RDL OVERWRITE WORKAROUND ---
+                // Power BI API does not support CreateOrOverwrite for RDL. 
+                // We must delete the old one first if it exists to simulate an update.
+                if (isRdl)
+                {
+                    Console.WriteLine($"[SERVICE] RDL detected. Checking for existing report to replace...");
+                    var existingReports = await client.Reports.GetReportsInGroupAsync(pbiWorkspaceId);
+                    var oldReport = existingReports.Value.FirstOrDefault(r => 
+                        string.Equals(r.Name, finalDisplayName, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(Path.GetFileNameWithoutExtension(r.Name), finalDisplayName, StringComparison.OrdinalIgnoreCase));
+                    
+                    if (oldReport != null)
+                    {
+                        Console.WriteLine($"[SERVICE] Found existing RDL '{oldReport.Name}' (ID: {oldReport.Id}). Deleting for replacement...");
+                        await client.Reports.DeleteReportInGroupAsync(pbiWorkspaceId, oldReport.Id);
+                        Console.WriteLine("[SERVICE] Old RDL deleted. Proceeding with clean upload.");
+                    }
+                }
+
+                // Paginated Reports (.rdl) ONLY support 'Abort' for nameConflict. 
+                // We handle 'Overwrite' manually by deleting the existing report first (lines 542-556).
                 var conflictMode = isRdl ? ImportConflictHandlerMode.Abort : ImportConflictHandlerMode.CreateOrOverwrite;
 
                 Console.WriteLine($"[SERVICE] DESTINATION: Workspace {pbiWorkspaceId}");
@@ -424,24 +590,96 @@ namespace PowerBI.Services
 
                 Import import;
                 Stream uploadStream = stream;
+                string? updatedXml = null;
 
-                // --- RDL NORMALIZATION & INJECTION ---
+                // --- DB PERSISTENCE & CONNECTION INJECTION ---
                 if (isRdl)
                 {
-                    uploadStream = NormalizeAndInjectRdl(stream, name);
-                    
-                    // CRITICAL: Save the normalized version locally so Discovery/Sidebar can see the injected parameters
+                    Console.WriteLine($">>>> [RDL-UPLOAD] Processing '{name}' for SQL Persistence...");
                     var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
                     if (!Directory.Exists(uploadsDir)) Directory.CreateDirectory(uploadsDir);
                     var filePath = Path.Combine(uploadsDir, finalDisplayName);
                     
-                    using (var fileStream = new FileStream(filePath, FileMode.Create))
+                    // 1. Load XML for manipulation
+                    XDocument xDoc;
+                    using (var tempMs = new MemoryStream())
                     {
-                        uploadStream.Position = 0;
-                        await uploadStream.CopyToAsync(fileStream);
-                        uploadStream.Position = 0;
+                        await stream.CopyToAsync(tempMs);
+                        tempMs.Position = 0;
+                        xDoc = XDocument.Load(tempMs);
+                        stream.Position = 0; // Reset original stream
                     }
-                    Console.WriteLine($"[SERVICE] Normalized RDL saved locally: {filePath}");
+                    var ns = xDoc.Root.GetDefaultNamespace();
+                    Console.WriteLine(">>>> [RDL-UPLOAD] XML loaded into memory.");
+
+                    // 1.5 Strip Parameter Layout (Prevent rsInvalidParameterLayoutCellDefNotEqualsParameterCount)
+                    var layout = xDoc.Descendants(ns + "ReportParametersLayout").FirstOrDefault();
+                    if (layout != null)
+                    {
+                        Console.WriteLine(">>>> [RDL-UPLOAD] Stripping stale Parameter Layout grid.");
+                        layout.Remove();
+                    }
+
+                    // 2. Inject Connection String (Convert Static to SQL)
+                    string? defaultConn = _config.GetConnectionString("DefaultConnection");
+                    if (!string.IsNullOrEmpty(defaultConn))
+                    {
+                        Console.WriteLine(">>>> [RDL-UPLOAD] Scanning for DataSources to inject ConnectionString...");
+                        var dataSources = xDoc.Descendants(ns + "DataSource");
+                        foreach (var ds in dataSources)
+                        {
+                            var connProps = ds.Element(ns + "ConnectionProperties");
+                            if (connProps != null)
+                            {
+                                // --- STATIC DATA PROTECTION ---
+                                // Check if any dataset using this datasource contains XML/Static data.
+                                // If it does, forcing 'SQL' provider will break the report.
+                                string dsName = ds.Attribute("Name")?.Value ?? "";
+                                bool hasStaticData = xDoc.Descendants(ns + "DataSet")
+                                    .Where(d => d.Element(ns + "Query")?.Element(ns + "DataSourceName")?.Value == dsName)
+                                    .Any(d => d.Element(ns + "Query")?.Element(ns + "CommandText")?.Value?.TrimStart().StartsWith("<Query", StringComparison.OrdinalIgnoreCase) == true);
+
+                                if (hasStaticData)
+                                {
+                                    Console.WriteLine($">>>> [RDL-UPLOAD] SKIP: DataSource '{dsName}' uses Static XML Data. Bypassing SQL Injection.");
+                                    continue;
+                                }
+
+                                var provider = connProps.Element(ns + "DataProvider");
+                                if (provider == null) 
+                                { 
+                                    provider = new XElement(ns + "DataProvider"); 
+                                    connProps.AddFirst(provider); 
+                                }
+                                
+                                // FORCE: Use 'SQL' (SQL Server) extension for local SQL connections.
+                                if (provider.Value != "SQL")
+                                {
+                                    Console.WriteLine($">>>> [RDL-UPLOAD] Updating DataProvider for '{dsName}' from '{provider.Value}' to 'SQL'.");
+                                    provider.Value = "SQL";
+                                }
+
+                                var connectString = connProps.Element(ns + "ConnectString");
+                                if (connectString == null) { connectString = new XElement(ns + "ConnectString"); connProps.Add(connectString); }
+                                connectString.Value = defaultConn;
+                                
+                                Console.WriteLine($">>>> [RDL-UPLOAD] ConnectionString injected into DataSource '{dsName}'.");
+                            }
+                        }
+                    }
+
+                    // 3. Save modified XML to string for DB storage
+                    updatedXml = xDoc.ToString();
+                    Console.WriteLine($">>>> [RDL-UPLOAD] RDL Content prepared (Size: {updatedXml.Length} chars).");
+                    
+                    // 4. Save locally for legacy discovery tools
+                    var utf8WithBom = new System.Text.UTF8Encoding(true);
+                    using (var sw = new StreamWriter(filePath, false, utf8WithBom)) { xDoc.Save(sw); }
+                    Console.WriteLine($">>>> [RDL-UPLOAD] Temporary RDL file saved to uploads folder.");
+                    
+                    // 5. Update upload stream
+                    byte[] fileBytes = utf8WithBom.GetBytes(updatedXml);
+                    uploadStream = new MemoryStream(fileBytes);
                 }
                 
                 // Step 1: Upload to Root
@@ -535,6 +773,12 @@ namespace PowerBI.Services
                             Console.WriteLine($"[SERVICE] SUCCESS: Found Report ID {reportToMove.Value}. Moving to Fabric Folder {folder.FabricFolderId}...");
                             await MoveItemToFolder(pbiWorkspaceId, reportToMove.Value, Guid.Parse(folder.FabricFolderId));
                             Console.WriteLine("[SERVICE] MOVE COMPLETED SUCCESSFULLY.");
+                            
+                            // Hotfix: Ensure credentials/datasources are synced after move
+                            await PatchReportCredentials(pbiWorkspaceId, reportToMove.Value);
+
+                            // Attach the discovered ID to the import object for the caller (hotfix) to use
+                            import.Reports = new List<Microsoft.PowerBI.Api.Models.Report> { new Microsoft.PowerBI.Api.Models.Report { Id = reportToMove.Value } };
                         }
                         else
                         {
@@ -543,7 +787,7 @@ namespace PowerBI.Services
                     }
                 }
 
-                return import;
+                return (import, isRdl ? updatedXml : null);
             }
             catch (Exception ex)
             {
@@ -551,193 +795,7 @@ namespace PowerBI.Services
             }
         }
 
-        // --- RDL XML ENGINE (HIGH-FIDELITY PATTERN) ---
-
-        private void ApplyInjectionToXDoc(XDocument xDoc, string paramName)
-        {
-            var ns = xDoc.Root.GetDefaultNamespace();
-
-            // --- PRE-SCAN: Check if this field exists in ANY dataset ---
-            // For ENTERDATA reports, if no dataset has the field, creating a parameter
-            // is harmful — it becomes an orphan "Required" param that blocks rendering.
-            var dataSets = xDoc.Descendants(ns + "DataSet").ToList();
-            bool anyDataSetHasField = false;
-            bool anySqlDataSet = false;
-
-            foreach (var ds in dataSets)
-            {
-                var q = ds.Element(ns + "Query");
-                var dsSourceName = q?.Element(ns + "DataSourceName")?.Value;
-                var provider = dsSourceName != null ? 
-                               xDoc.Descendants(ns + "DataSource").FirstOrDefault(d => d.Attribute("Name")?.Value == dsSourceName)?.Descendants(ns + "DataProvider").FirstOrDefault()?.Value : null;
-
-                if (provider != null && provider.Contains("SQL", StringComparison.OrdinalIgnoreCase))
-                {
-                    anySqlDataSet = true;
-                    break; // SQL datasets can reference any DB column, so always inject
-                }
-
-                var dsFields = ds.Element(ns + "Fields")?.Elements(ns + "Field").Select(f => f.Attribute("Name")?.Value).ToList();
-                if (dsFields != null && dsFields.Contains(paramName))
-                {
-                    anyDataSetHasField = true;
-                }
-            }
-
-            // If no SQL dataset and no ENTERDATA dataset has this field, skip entirely
-            if (!anySqlDataSet && !anyDataSetHasField)
-            {
-                Console.WriteLine($"[RDL-ENGINE] SKIP-ALL: Field '{paramName}' not found in ANY dataset. Parameter will NOT be created.");
-                return;
-            }
-
-            // 1. Ensure Parameter Definition
-            var paramsNode = xDoc.Descendants(ns + "ReportParameters").FirstOrDefault();
-            if (paramsNode == null)
-            {
-                paramsNode = new XElement(ns + "ReportParameters");
-                xDoc.Root.AddFirst(paramsNode);
-            }
-
-            if (!paramsNode.Elements(ns + "ReportParameter").Any(p => p.Attribute("Name")?.Value == paramName))
-            {
-                Console.WriteLine($"[RDL-ENGINE] Creating parameter: {paramName}");
-                
-                // Build a CLEAN parameter from scratch — do NOT clone templates.
-                var newParam = new XElement(ns + "ReportParameter",
-                    new XAttribute("Name", paramName),
-                    new XElement(ns + "DataType", "String"),
-                    new XElement(ns + "Nullable", "true"),
-                    new XElement(ns + "Prompt", paramName)
-                );
-                paramsNode.Add(newParam);
-            }
-
-            // 2. DataSet Injection (SQL or Static)
-            foreach (var ds in dataSets)
-            {
-                var q = ds.Element(ns + "Query");
-                var dsSourceName = q?.Element(ns + "DataSourceName")?.Value;
-                var provider = dsSourceName != null ? 
-                               xDoc.Descendants(ns + "DataSource").FirstOrDefault(d => d.Attribute("Name")?.Value == dsSourceName)?.Descendants(ns + "DataProvider").FirstOrDefault()?.Value : null;
-
-                bool isSql = provider != null && provider.Contains("SQL", StringComparison.OrdinalIgnoreCase);
-
-                if (isSql)
-                {
-                    var cmd = q.Element(ns + "CommandText");
-                    if (cmd != null && !cmd.Value.Contains($"@{paramName}"))
-                    {
-                        if (cmd.Value.Contains("WHERE", StringComparison.OrdinalIgnoreCase))
-                            cmd.Value = cmd.Value.Replace("WHERE", $"WHERE {paramName} = @{paramName} AND ", StringComparison.OrdinalIgnoreCase);
-                        else if (cmd.Value.Contains("ORDER BY", StringComparison.OrdinalIgnoreCase))
-                            cmd.Value = cmd.Value.Replace("ORDER BY", $"WHERE {paramName} = @{paramName} ORDER BY ", StringComparison.OrdinalIgnoreCase);
-                        else
-                            cmd.Value += $" WHERE {paramName} = @{paramName}";
-                    }
-                }
-                else
-                {
-                    // Strategy B: Static/ENTERDATA - Use <Filters> node ONLY.
-                    var dsFields = ds.Element(ns + "Fields")?.Elements(ns + "Field").Select(f => f.Attribute("Name")?.Value).ToList();
-                    if (dsFields != null && dsFields.Contains(paramName))
-                    {
-                        Console.WriteLine($"[RDL-ENGINE] Injecting <Filter> for '{paramName}' into DataSet '{ds.Attribute("Name")?.Value}'");
-                        var filtersNode = ds.Element(ns + "Filters");
-                        if (filtersNode == null) 
-                        { 
-                            filtersNode = new XElement(ns + "Filters"); 
-                            var fieldsNode = ds.Element(ns + "Fields");
-                            if (fieldsNode != null)
-                                fieldsNode.AddAfterSelf(filtersNode);
-                            else
-                                ds.Add(filtersNode);
-                        }
-
-                        if (!filtersNode.Descendants(ns + "FilterValue").Any(v => v.Value == $"=Parameters!{paramName}.Value"))
-                        {
-                            var newFilter = new XElement(ns + "Filter",
-                                new XElement(ns + "FilterExpression", $"=Fields!{paramName}.Value"),
-                                new XElement(ns + "Operator", "Equal"),
-                                new XElement(ns + "FilterValues", new XElement(ns + "FilterValue", $"=Parameters!{paramName}.Value"))
-                            );
-                            filtersNode.Add(newFilter);
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[RDL-ENGINE] SKIP: Field '{paramName}' not in DataSet '{ds.Attribute("Name")?.Value}'");
-                    }
-                }
-            }
-        }
-
-        private MemoryStream NormalizeAndInjectRdl(Stream inputMetadata, string? rdlName, List<string>? customParams = null)
-        {
-            Console.WriteLine($"[RDL-ENGINE] Normalizing: {rdlName} (Custom Params: {customParams?.Count ?? 0})");
-            
-            XDocument xDoc;
-            var mStream = new MemoryStream();
-            inputMetadata.CopyTo(mStream);
-            mStream.Position = 0;
-            
-            using (var reader = new StreamReader(mStream, leaveOpen: true)) { xDoc = XDocument.Load(reader); }
-            
-            var ns = xDoc.Root.GetDefaultNamespace();
-
-            // 1. TenantId Injection (Always)
-            ApplyInjectionToXDoc(xDoc, "TenantId");
-
-            // 2. Custom Parameters Injection
-            if (customParams != null)
-            {
-                foreach (var pName in customParams)
-                {
-                    ApplyInjectionToXDoc(xDoc, pName);
-                }
-            }
-
-            // 3. Layout Reset
-            xDoc.Descendants(ns + "ReportParametersLayout").Remove();
-
-            // 4. Save
-            var output = new MemoryStream();
-            var settings = new XmlWriterSettings { Encoding = new UTF8Encoding(true), Indent = true };
-            using (var writer = XmlWriter.Create(output, settings)) { xDoc.Save(writer); }
-            output.Position = 0;
-            return output;
-        }
-
-        public async Task InjectManualFilterToRdl(int localReportId, string paramName, AppDbContext db)
-        {
-            var report = await db.Reports.FindAsync(localReportId);
-            if (report == null) throw new Exception("Report not found.");
-
-            var fileName = report.Name.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? report.Name : $"{report.Name}.rdl";
-            var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fileName);
-            
-            if (!File.Exists(filePath)) throw new Exception($"Local RDL file not found: {filePath}");
-
-            Console.WriteLine($"[RDL-ENGINE] Manual Injection: {paramName} into {fileName}");
-
-            XDocument xDoc;
-            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            {
-                xDoc = XDocument.Load(fs);
-            }
-
-            // Apply shared high-fidelity injection logic
-            ApplyInjectionToXDoc(xDoc, paramName);
-
-            // Save back
-            var settings = new XmlWriterSettings { Encoding = new UTF8Encoding(true), Indent = true };
-            using (var writer = XmlWriter.Create(filePath, settings))
-            {
-                xDoc.Save(writer);
-            }
-            
-            Console.WriteLine($"[RDL-ENGINE] SUCCESS: {paramName} injected and saved to {fileName}");
-        }
+        // --- REMOVED LEGACY CLONING LOGIC (DEPRECATED FOR SINGLE REPORT ARCHITECTURE) ---
 
 
 
@@ -769,7 +827,7 @@ namespace PowerBI.Services
                 {
                     // Find the local report record first
                     var localRep = db.Reports.FirstOrDefault(r => r.PowerBIReportId == reportId.ToString());
-                    if (localRep != null)
+                    if (localRep != null && db.ReportFilters != null)
                     {
                         var hasSecurityParam = db.ReportFilters.Any(f => f.ReportId == localRep.Id && f.ColumnName == "TenantId");
                         if (hasSecurityParam && !rdlParams.Any(p => p.Name == "TenantId"))
@@ -818,53 +876,222 @@ namespace PowerBI.Services
             }
         }
 
-        public async Task<ReportEmbedConfig> GetEmbedConfig(Guid workspaceId, Guid reportId)
+        public async Task<ReportEmbedConfig> GetEmbedConfig(Guid workspaceId, Guid reportId, AppDbContext db, List<ParameterValue>? parameterValues = null)
         {
             Console.WriteLine($"[SERVICE] Fetching Embed Config for Report {reportId}");
+            
+            // 1. Fetch from local DB to get cached DatasetId
+            var localReport = await db.Reports.FirstOrDefaultAsync(r => r.PowerBIReportId == reportId.ToString());
+            string? targetDatasetId = localReport?.PowerBIDatasetId;
+
+            // DIAGNOSTIC: Check datasource status before embedding
+            await PatchReportCredentials(workspaceId, reportId);
+            
             var client = await GetClient();
 
-            var report = await client.Reports.GetReportInGroupAsync(workspaceId, reportId);
-            
-            var generateTokenRequestParameters = new GenerateTokenRequest(accessLevel: "view");
-            var tokenResponse = await client.Reports.GenerateTokenInGroupAsync(workspaceId, reportId, generateTokenRequestParameters);
+            try {
+                var report = await client.Reports.GetReportInGroupAsync(workspaceId, reportId);
+                
+                // DIAGNOSTIC: Check Capacity Assignment
+                var group = await client.Groups.GetGroupsAsync(filter: $"id eq '{workspaceId}'");
+                var workspaceInfo = group.Value.FirstOrDefault();
+                string capacityStr = workspaceInfo?.CapacityId?.ToString() ?? "NONE";
+                Console.WriteLine($">>>> [CAPACITY] Workspace: {workspaceInfo?.Name}, CapacityId: {capacityStr}");
+                
+                if (capacityStr == "NONE" || workspaceInfo?.CapacityId == Guid.Empty)
+                {
+                    Console.WriteLine(">>>> [CAPACITY] WARNING: Workspace is NOT assigned to a capacity. RDLs might not render for Service Principal.");
+                }
 
-            Console.WriteLine("[SERVICE] Embed Token generated successfully.");
+                var accessToken = await _auth.GetAccessToken();
+                using var httpClient = new HttpClient();
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                
+                // --- RDL DATA ACCESS FIX (SUPER-DISCOVERY) ---
+                bool isRdl = report.ReportType == "RDL" || report.ReportType == "PaginatedReport";
 
-            return new ReportEmbedConfig
+                if (!isRdl && string.IsNullOrEmpty(targetDatasetId))
+                {
+                    targetDatasetId = report.DatasetId;
+                    
+                    if (string.IsNullOrEmpty(targetDatasetId))
+                    {
+                        Console.WriteLine($">>>> [TOKEN] DatasetId null for '{report.Name}'. Scanning all Workspace Datasets...");
+                        var allDatasets = await client.Datasets.GetDatasetsInGroupAsync(workspaceId);
+                        
+                        foreach (var ds in allDatasets.Value)
+                        {
+                            Console.WriteLine($">>>> [TOKEN]   Scanning Dataset: '{ds.Name}' (ID: {ds.Id})");
+                            try 
+                            {
+                                var dsSources = await client.Datasets.GetDatasourcesInGroupAsync(workspaceId, ds.Id);
+                                foreach(var source in dsSources.Value)
+                                {
+                                    string server = source.ConnectionDetails?.Server ?? "UNKNOWN";
+                                    string dbName = source.ConnectionDetails?.Database ?? "UNKNOWN";
+                                    Console.WriteLine($">>>> [TOKEN]   Checking Dataset '{ds.Name}': Server='{server}', DB='{dbName}'");
+
+                                    if (server.Contains("zsdeskt8ibnl5", StringComparison.OrdinalIgnoreCase) || 
+                                        server.Contains("localhost", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        targetDatasetId = ds.Id;
+                                        Console.WriteLine($">>>> [TOKEN] FOUND MATCH! Mapping Report to Dataset ID: {targetDatasetId}");
+                                        break;
+                                    }
+                                }
+                            } catch { }
+                            if (!string.IsNullOrEmpty(targetDatasetId)) break;
+                        }
+
+                        if (string.IsNullOrEmpty(targetDatasetId))
+                        {
+                            Console.WriteLine(">>>> [TOKEN] DNA Scan failed. Trying Name Match...");
+                            var allDatasetsList = allDatasets.Value.ToList();
+                            var nameMatch = allDatasetsList.FirstOrDefault(d => 
+                                d.Name.Contains(report.Name, StringComparison.OrdinalIgnoreCase) || 
+                                report.Name.Contains(d.Name, StringComparison.OrdinalIgnoreCase));
+                                
+                            if (nameMatch != null) 
+                            {
+                                targetDatasetId = nameMatch.Id;
+                                Console.WriteLine($">>>> [TOKEN] NAME MATCH! Using Dataset: {nameMatch.Name} ({targetDatasetId})");
+                            }
+                        }
+
+                        if (string.IsNullOrEmpty(targetDatasetId))
+                        {
+                            Console.WriteLine(">>>> [TOKEN] WARNING: No shadow dataset found. Using ReportId as DatasetId fallback...");
+                            targetDatasetId = report.Id.ToString();
+                        }
+                    }
+                }
+                else if (isRdl)
+                {
+                    Console.WriteLine($">>>> [TOKEN] RDL Detected: Proceeding with cautious dataset discovery.");
+                    // We don't null it here anymore; we let the scan logic above (DNA/Name match) try to find the shadow dataset.
+                }
+
+
+                // --- AZURE-IT-SPEC: RAW REST TOKEN GENERATION ---
+                Console.WriteLine($">>>> [TOKEN] Generating Token for Report: {report.Id}");
+                
+                // NOTE: Datasource identities and manual binding are bypassed here for RDLs
+                // because 'PatchReportCredentials' (called above) already established the Gateway handshake.
+
+                // --- AZURE-IT-SPEC: MODERN V2 GENERATE TOKEN ---
+                var v2TokenRequest = new Dictionary<string, object>
+                {
+                    { "reports", new[] { new { id = report.Id.ToString() } } },
+                    { "targetWorkspaces", new[] { new { id = workspaceId.ToString() } } },
+                    { "xmlaPermissions", "ReadOnly" }
+                };
+
+                // Add datasets if found (helps authorize RDL data sources)
+                if (!string.IsNullOrEmpty(targetDatasetId))
+                {
+                    v2TokenRequest["datasets"] = new[] { new { id = targetDatasetId } };
+                }
+                else if (report.ReportType != "RDL" && report.ReportType != "PaginatedReport")
+                {
+                    // Fallback for standard reports using SDK property
+                    v2TokenRequest["datasets"] = new[] { new { id = report.DatasetId } };
+                }
+
+                string tokenUrl = "https://api.powerbi.com/v1.0/myorg/GenerateToken";
+                var tokenResponse = await httpClient.PostAsync(tokenUrl, new StringContent(JsonConvert.SerializeObject(v2TokenRequest), Encoding.UTF8, "application/json"));
+                
+                if (!tokenResponse.IsSuccessStatusCode)
+                {
+                    var error = await tokenResponse.Content.ReadAsStringAsync();
+                    Console.WriteLine($">>>> [TOKEN] FAILED: {error}");
+                    throw new Exception($"Token API failed: {error}");
+                }
+
+                var tokenResult = JsonConvert.DeserializeObject<dynamic>(await tokenResponse.Content.ReadAsStringAsync());
+                string embedToken = tokenResult?.token;
+                Console.WriteLine("[SERVICE] Embed Token generated successfully.");
+
+                var embedUrl = report.EmbedUrl;
+                
+                // Convert to RDL embed if needed (CRITICAL for RDL rendering)
+                if (report.ReportType == "PaginatedReport" && !embedUrl.Contains("rdlEmbed"))
+                {
+                    embedUrl = embedUrl.Replace("reportEmbed", "rdlEmbed");
+                }
+
+                // --- SYNC PARAMETERS INTO URL (FOR STABILITY) ---
+                if (isRdl || (parameterValues != null && parameterValues.Any()))
+                {
+                    var rdlUrlParams = new List<string>();
+                    
+                    if (isRdl)
+                    {
+                        rdlUrlParams.Add("rdl:parameterPanel=collapsed");
+                    }
+
+                    if (parameterValues != null && parameterValues.Any())
+                    {
+                        foreach (var p in parameterValues)
+                        {
+                            rdlUrlParams.Add($"rp:{Uri.EscapeDataString(p.Name)}={Uri.EscapeDataString(p.Value ?? "")}");
+                        }
+                    }
+
+                    if (rdlUrlParams.Any())
+                    {
+                        string separator = embedUrl.Contains("?") ? "&" : "?";
+                        embedUrl += separator + string.Join("&", rdlUrlParams);
+                    }
+                    
+                    Console.WriteLine($">>>> [TRACE] FINAL EMBED URL: {embedUrl}");
+                }
+
+                return new ReportEmbedConfig
+                {
+                    ReportId = report.Id.ToString(),
+                    DatasetId = report.DatasetId,
+                    EmbedUrl = embedUrl,
+                    EmbedToken = embedToken,
+                    ReportName = report.Name,
+                    ReportType = report.ReportType,
+                    LocalReportId = localReport?.Id ?? 0,
+                    WorkspaceId = workspaceId.ToString(),
+                    TenantId = _config["PowerBI:TenantId"] ?? "UNKNOWN",
+                    Parameters = parameterValues?.ToDictionary(p => p.Name ?? "", p => p.Value ?? "") ?? new()
+                };
+            }
+            catch (Microsoft.Rest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                ReportId = report.Id.ToString(),
-                DatasetId = report.DatasetId,
-                EmbedUrl = report.EmbedUrl,
-                EmbedToken = tokenResponse.Token,
-                ReportName = report.Name
-            };
+                throw new Exception("The report was not found in Power BI. It may have been deleted or moved. Please try syncing your workspace again.");
+            }
         }
 
 
-        public async Task DiscoverReportFilters(int reportId, Guid? datasetId, AppDbContext db)
+        public async Task<bool> DiscoverReportFilters(int reportId, Guid? datasetId, AppDbContext db, int userId)
         {
+            bool modified = false;
             var report = await db.Reports.FindAsync(reportId);
-            if (report == null) throw new Exception("Report not found in local DB.");
+            if (report == null) return false;
 
             var workspace = await db.Workspaces.FindAsync(report.WorkspaceId);
             if (workspace == null || string.IsNullOrEmpty(workspace.PowerBIWorkspaceId))
                 throw new Exception("Workspace not found or not synced.");
 
-            Console.WriteLine($"[SCHEMA-DISCOVERY] MODE: {report.ReportType}");
+            Console.WriteLine($"[SCHEMA-DISCOVERY] MODE: {report.ReportType} (USER: {userId})");
             Console.WriteLine($"[SCHEMA-DISCOVERY] Report Name: {report.Name}");
 
-            var existing = db.ReportFilters.Where(f => f.ReportId == reportId).ToList();
-            Console.WriteLine($"[SCHEMA-DISCOVERY] Purging {existing.Count} stale records for reportId={reportId}");
-            db.ReportFilters.RemoveRange(existing);
-            await db.SaveChangesAsync();
+            var existingFilters = db.ReportFilters
+                .Where(f => f.ReportId == reportId && f.UserId == userId)
+                .ToList();
 
+            var processedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int count = 0;
 
             if (report.ReportType == "RDL")
             {
                 try
                 {
-                    Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: Attempting API discovery...");
+                    Console.WriteLine($">>>> [FLOW] RDL: Attempting API discovery for report '{report.Name}'...");
                     var token = await _auth.GetAccessToken();
                     using var httpClient = new HttpClient();
                     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -873,6 +1100,7 @@ namespace PowerBI.Services
                     var response = await httpClient.GetAsync(url);
                     if (response.IsSuccessStatusCode)
                     {
+                        Console.WriteLine($">>>> [FLOW] RDL: API discovery successful.");
                         var rawJson = await response.Content.ReadAsStringAsync();
                         var root = Newtonsoft.Json.Linq.JObject.Parse(rawJson);
                         var parameters = root["value"] as Newtonsoft.Json.Linq.JArray;
@@ -883,92 +1111,106 @@ namespace PowerBI.Services
                             {
                                 string? paramName = param["name"]?.ToString();
                                 if (string.IsNullOrEmpty(paramName)) continue;
+                                Console.WriteLine($">>>> [FLOW] RDL: Identified Parameter (API): {paramName}");
 
-                                db.ReportFilters.Add(new ReportFilter
+                                var existing = existingFilters.FirstOrDefault(f => f.TableName == "RDL_PARAMETER" && f.ColumnName == paramName);
+                                if (existing == null)
                                 {
-                                    ReportId = reportId,
-                                    TableName = "RDL_PARAMETER",
-                                    ColumnName = paramName,
-                                    DisplayName = paramName,
-                                    IsActive = true
-                                });
+                                    existing = new ReportFilter
+                                    {
+                                        ReportId = reportId,
+                                        TableName = "RDL_PARAMETER",
+                                        ColumnName = paramName,
+                                        DisplayName = paramName,
+                                        IsActive = true,
+                                        UserId = userId,
+                                        IsCustom = false
+                                    };
+                                    db.ReportFilters.Add(existing);
+                                }
+                                else if (!existing.IsCustom)
+                                {
+                                    existing.IsActive = true;
+                                }
+                                processedKeys.Add($"RDL_PARAMETER|{paramName}");
                                 count++;
                             }
                         }
                     }
                     else
                     {
-                        Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: API returned {response.StatusCode}. Processing via XML Parsing...");
-                        var fileName = report.Name.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? report.Name : $"{report.Name}.rdl";
-                        var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fileName);
-                        
-                        if (File.Exists(filePath))
+                        Console.WriteLine($">>>> [FLOW] RDL: API returned {response.StatusCode}. Falling back to Local Parsing...");
+                        string? rdlXml = report.RdlContent;
+                        XDocument xDoc;
+
+                        if (!string.IsNullOrEmpty(rdlXml))
                         {
-                            XDocument xDoc = XDocument.Load(filePath);
-                            var ns = xDoc.Root.GetDefaultNamespace();
+                            xDoc = XDocument.Parse(rdlXml);
+                        }
+                        else
+                        {
+                            var rdlName = report.Name ?? "Unknown";
+                            var fName = rdlName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? rdlName : $"{rdlName}.rdl";
+                            var fPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fName);
+                            if (File.Exists(fPath)) xDoc = XDocument.Load(fPath);
+                            else return false;
+                        }
 
-                            var rdlParamsList = xDoc.Descendants(ns + "ReportParameter");
+                        var ns = xDoc.Root.GetDefaultNamespace();
+                        var rdlParamsList = xDoc.Descendants(ns + "ReportParameter");
 
-                            foreach (var p in rdlParamsList)
+                        foreach (var p in rdlParamsList)
+                        {
+                            string? paramName = p.Attribute("Name")?.Value;
+                            if (string.IsNullOrEmpty(paramName)) continue;
+                            
+                            var existing = existingFilters.FirstOrDefault(f => f.TableName == "RDL_PARAMETER" && f.ColumnName == paramName);
+                            if (existing == null)
                             {
-                                string? paramName = p.Attribute("Name")?.Value;
-                                if (string.IsNullOrEmpty(paramName) || paramName == "TenantId") continue;
-
-                                Console.WriteLine($"[SCHEMA-DISCOVERY] RDL XML: Found Parameter '{paramName}'");
-                                db.ReportFilters.Add(new PowerBI.Models.ReportFilter
-                                {
-                                    ReportId = reportId,
-                                    TableName = "RDL_PARAMETER",
-                                    ColumnName = paramName, 
-                                    DisplayName = paramName,
-                                    IsActive = true
-                                });
-                                count++;
+                                existing = new ReportFilter { ReportId = reportId, TableName = "RDL_PARAMETER", ColumnName = paramName, DisplayName = paramName, IsActive = true, UserId = userId, IsCustom = false };
+                                db.ReportFilters.Add(existing);
                             }
-                            Console.WriteLine($"[SCHEMA-DISCOVERY] RDL: XML parsing found {count} parameters.");
+                            processedKeys.Add($"RDL_PARAMETER|{paramName}");
+                            count++;
+                        }
+
+                        // SELF-HEALING & UNIVERSAL SYNC
+                        // We force injection for all active custom filters to ensure they are applied to ALL datasets 
+                        // (handles the case where a filter was previously injected but missed some datasets).
+                        var activeCustoms = existingFilters.Where(f => f.IsCustom && f.IsActive).ToList();
+                        foreach (var m in activeCustoms)
+                        {
+                            var injectRes = await InjectFilterToRdl(reportId, m.ColumnName, db);
+                            if (injectRes.Success)
+                            {
+                                if (!processedKeys.Contains($"{m.TableName}|{m.ColumnName}"))
+                                    processedKeys.Add($"{m.TableName}|{m.ColumnName}");
+                                modified = true;
+                            }
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[SCHEMA-DISCOVERY] RDL Error: {ex.Message}");
-                    throw new Exception($"Failed to discover RDL parameters: {ex.Message}");
-                }
+                catch (Exception ex) { Console.WriteLine($"[SCHEMA-DISCOVERY] RDL Error: {ex.Message}"); }
             }
             else
             {
                 if (!datasetId.HasValue) throw new Exception("Dataset ID is missing for Power BI report.");
-
-                string rawJson;
-                try
+                var token = await _auth.GetAccessToken();
+                using var httpClient = new HttpClient();
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                var url = $"https://api.powerbi.com/v1.0/myorg/datasets/{datasetId}/tables";
+                var response = await httpClient.GetAsync(url);
+                if (response.IsSuccessStatusCode)
                 {
-                    var token = await _auth.GetAccessToken();
-                    using var httpClient = new HttpClient();
-                    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    var url = $"https://api.powerbi.com/v1.0/myorg/datasets/{datasetId}/tables";
-
-                    Console.WriteLine($"[SCHEMA-DISCOVERY] Calling: GET {url}");
-                    var response = await httpClient.GetAsync(url);
-                    rawJson = await response.Content.ReadAsStringAsync();
-
-                    if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
-                    {
-                        throw new Exception("Access Denied (403). For Service Principals, this usually means the workspace is NOT on a Premium/Fabric capacity, or the 'XMLA Endpoint' setting is not 'Read Write'. Please wait a few minutes after assigning the capacity and try again.");
-                    }
-
-                    if (!response.IsSuccessStatusCode)
-                        throw new Exception($"Power BI REST API returned {(int)response.StatusCode}: {rawJson}");
-
+                    var rawJson = await response.Content.ReadAsStringAsync();
                     var root = Newtonsoft.Json.Linq.JObject.Parse(rawJson);
                     var tables = root["value"] as Newtonsoft.Json.Linq.JArray;
-
                     if (tables != null)
                     {
                         foreach (var tbl in tables)
                         {
                             string? tableName = tbl["name"]?.ToString();
                             if (string.IsNullOrEmpty(tableName)) continue;
-
                             var cols = tbl["columns"] as Newtonsoft.Json.Linq.JArray;
                             if (cols != null)
                             {
@@ -976,37 +1218,36 @@ namespace PowerBI.Services
                                 {
                                     string? colName = col["name"]?.ToString();
                                     if (string.IsNullOrEmpty(colName)) continue;
-
-                                    db.ReportFilters.Add(new ReportFilter
+                                    var existing = existingFilters.FirstOrDefault(f => f.TableName == tableName && f.ColumnName == colName);
+                                    if (existing == null)
                                     {
-                                        ReportId = reportId,
-                                        TableName = tableName,
-                                        ColumnName = colName,
-                                        DisplayName = colName,
-                                        IsActive = count < 6
-                                    });
+                                        existing = new ReportFilter { ReportId = reportId, TableName = tableName, ColumnName = colName, DisplayName = colName, IsActive = count < 6, UserId = userId };
+                                        db.ReportFilters.Add(existing);
+                                    }
+                                    processedKeys.Add($"{tableName}|{colName}");
                                     count++;
                                 }
                             }
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    throw new Exception($"Failed to discover Power BI schema: {ex.Message}");
-                }
+            }
+
+            foreach (var f in existingFilters)
+            {
+                if (!processedKeys.Contains($"{f.TableName}|{f.ColumnName}") && !f.IsCustom)
+                    db.ReportFilters.Remove(f);
             }
 
             if (count == 0) throw new Exception("No queryable fields or parameters discovered.");
-
             await db.SaveChangesAsync();
-            Console.WriteLine($"[SCHEMA-DISCOVERY] SUCCESS: {count} field(s) persisted to DB.");
+            return modified;
         }
 
 
 
 
-        public async Task<List<string>> GetColumnValues(Guid? datasetId, string tableName, string columnName, Guid? reportId = null, Guid? workspaceId = null, AppDbContext? db = null)
+        public async Task<List<string>> GetColumnValues(Guid? datasetId, string tableName, string columnName, Guid? reportId = null, Guid? workspaceId = null, AppDbContext? db = null, string reportType = "PowerBI")
         {
             if (string.IsNullOrEmpty(tableName) || string.IsNullOrEmpty(columnName))
                 throw new Exception("[DYNAMIC] Error: Missing Table or Column name.");
@@ -1026,17 +1267,13 @@ namespace PowerBI.Services
                     var response = await httpClient.GetAsync(url);
                     if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
                     {
-                        // Try alternative endpoint (without /groups/)
-                        Console.WriteLine(">>>> [TERMINAL-LOG] Group API failed, trying direct report API...");
                         url = $"https://api.powerbi.com/v1.0/myorg/reports/{reportId}/parameters";
                         response = await httpClient.GetAsync(url);
                     }
 
-                    var rawJson = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($">>>> [TERMINAL-LOG] DEBUG RDL API Response: {rawJson}");
-                    
                     if (response.IsSuccessStatusCode)
                     {
+                        var rawJson = await response.Content.ReadAsStringAsync();
                         var root = Newtonsoft.Json.Linq.JObject.Parse(rawJson);
                         var parameters = root["value"] as Newtonsoft.Json.Linq.JArray;
 
@@ -1044,14 +1281,12 @@ namespace PowerBI.Services
                         {
                             foreach (var param in parameters)
                             {
-                                if (param["name"]?.ToString() == columnName)
+                                if (param["name"]?.ToString().Equals(columnName, StringComparison.OrdinalIgnoreCase) == true)
                                 {
                                     var suggestedValues = param["suggestedValues"] as Newtonsoft.Json.Linq.JArray;
                                     if (suggestedValues != null)
                                     {
-                                        var result = suggestedValues.Select(v => v.ToString()).ToList();
-                                        Console.WriteLine($">>>> [TERMINAL-LOG] SUCCESS: Found {result.Count} suggested values for '{columnName}' via API");
-                                        return result;
+                                        return suggestedValues.Select(v => v.ToString()).ToList();
                                     }
                                 }
                             }
@@ -1059,42 +1294,34 @@ namespace PowerBI.Services
                     }
 
                     // FALLBACK: Parse XML for ValidValues
-                    Console.WriteLine($">>>> [TERMINAL-LOG] RDL: API failed or empty. Parsing XML for '{columnName}' values...");
-                    
                     var uploadsDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads");
-                    // Try to find the specific file for this report first
                     string? specificFile = null;
                     if (reportId.HasValue && db != null)
                     {
                         var reportRecord = await db.Reports.FirstOrDefaultAsync(r => r.PowerBIReportId == reportId.Value.ToString());
                         if (reportRecord != null)
                         {
-                            var fileName = reportRecord.Name.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? reportRecord.Name : $"{reportRecord.Name}.rdl";
-                            specificFile = Path.Combine(uploadsDir, fileName);
+                            string reportName = reportRecord.Name ?? "UnknownReport";
+                            var fileName = reportName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? reportName : $"{reportName}.rdl";
+                            var path = Path.Combine(uploadsDir, fileName);
+                            if (File.Exists(path)) specificFile = path;
                         }
                     }
 
-                    var filesToScan = specificFile != null && File.Exists(specificFile) 
-                        ? new[] { specificFile } 
-                        : Directory.GetFiles(uploadsDir, "*.rdl");
+                    var filesToScan = (specificFile != null) ? new[] { specificFile } : Directory.GetFiles(uploadsDir, "*.rdl");
                     
                     foreach (var file in filesToScan)
                     {
                         XmlDocument xmlDoc = new XmlDocument();
                         xmlDoc.Load(file);
                         XmlNamespaceManager nsMgr = new XmlNamespaceManager(xmlDoc.NameTable);
-                        nsMgr.AddNamespace("rdl", xmlDoc.DocumentElement.NamespaceURI);
+                        if (xmlDoc.DocumentElement != null)
+                            nsMgr.AddNamespace("rdl", xmlDoc.DocumentElement.NamespaceURI);
 
-                        // Find the parameter by name
                         var paramNode = xmlDoc.SelectSingleNode($"//rdl:ReportParameter[@Name='{columnName}']", nsMgr);
                         if (paramNode != null)
                         {
-                            var dsRef = paramNode.SelectSingleNode("rdl:ValidValues/rdl:DataSetReference", nsMgr);
-                            if (dsRef != null)
-                            {
-                                Console.WriteLine($"[SERVICE] RDL: Parameter '{columnName}' is Query-based (DataSet: {dsRef.SelectSingleNode("rdl:DataSetName", nsMgr)?.InnerText}). User must type value manually.");
-                            }
-
+                            // 1. Check for static valid values
                             var validValues = paramNode.SelectNodes("rdl:ValidValues/rdl:ParameterValues/rdl:ParameterValue", nsMgr);
                             if (validValues != null && validValues.Count > 0)
                             {
@@ -1105,13 +1332,50 @@ namespace PowerBI.Services
                                     string? value = val.SelectSingleNode("rdl:Value", nsMgr)?.InnerText;
                                     xmlResults.Add(label ?? value ?? "");
                                 }
-                                Console.WriteLine($">>>> [TERMINAL-LOG] SUCCESS: Found {xmlResults.Count} values in XML for '{columnName}'");
                                 return xmlResults.Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+                            }
+
+                            // 2. Check for DataSetReference (Dynamic/Embedded Values)
+                            var dsRef = paramNode.SelectSingleNode("rdl:ValidValues/rdl:DataSetReference", nsMgr);
+                            if (dsRef != null)
+                            {
+                                string? dsName = dsRef.SelectSingleNode("rdl:DataSetName", nsMgr)?.InnerText;
+                                string? valueField = dsRef.SelectSingleNode("rdl:ValueField", nsMgr)?.InnerText;
+                                
+                                if (!string.IsNullOrEmpty(dsName) && !string.IsNullOrEmpty(valueField))
+                                {
+                                    var dsNode = xmlDoc.SelectSingleNode($"//rdl:DataSet[@Name='{dsName}']", nsMgr);
+                                    var commandText = dsNode?.SelectSingleNode("rdl:Query/rdl:CommandText", nsMgr)?.InnerText;
+                                    
+                                    if (!string.IsNullOrEmpty(commandText) && commandText.Contains("<XmlData>"))
+                                    {
+                                        try
+                                        {
+                                            // Handle escaped XML within CommandText
+                                            string rawXml = commandText.Trim();
+                                            if (rawXml.StartsWith("<Query"))
+                                            {
+                                                XmlDocument innerXml = new XmlDocument();
+                                                innerXml.LoadXml(rawXml);
+                                                var dataNodes = innerXml.SelectNodes($"//Row/{valueField}");
+                                                if (dataNodes != null)
+                                                {
+                                                    var dsResults = new List<string>();
+                                                    foreach (XmlNode node in dataNodes) dsResults.Add(node.InnerText);
+                                                    return dsResults.Where(s => !string.IsNullOrEmpty(s)).Distinct().ToList();
+                                                }
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($">>>> [TERMINAL-LOG] Failed to parse embedded XmlData: {ex.Message}");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
 
-                    Console.WriteLine($"[SERVICE] RDL: No suggested values found in API or XML for '{columnName}'.");
                     return new List<string>();
                 }
                 catch (Exception ex)
@@ -1120,12 +1384,19 @@ namespace PowerBI.Services
                     return new List<string>(); 
                 }
             }
+            if (reportType == "RDL" || reportType == "PaginatedReport")
+            {
+                Console.WriteLine($">>>> [FLOW] Skipping DAX probe for {reportType} report field '{columnName}'. RDLs only support parameter-based value discovery.");
+                return new List<string>(); // RDLs don't support DAX queries on datasets via this API
+            }
+
             if (!datasetId.HasValue) throw new Exception("Dataset ID required for Power BI values.");
 
             var daxQuery = $"EVALUATE DISTINCT('{tableName}'[{columnName}])";
             
             Console.WriteLine("--------------------------------------------------");
-            Console.WriteLine($"[DYNAMIC] PROBE: '{tableName}'[{columnName}]");
+            Console.WriteLine($">>>> [FLOW] Starting DAX Probe for Power BI report...");
+            Console.WriteLine($"[DYNAMIC] TARGET: '{tableName}'[{columnName}]");
             Console.WriteLine($"[DYNAMIC] DAX: {daxQuery}");
 
             var results = new List<string>();
@@ -1165,7 +1436,7 @@ namespace PowerBI.Services
                         }
                     }
                 }
-                Console.WriteLine($"[DYNAMIC] RESULT: {results.Count} values found.");
+                Console.WriteLine($">>>> [FLOW] DAX Result: {results.Count} values found.");
             }
             catch (Exception ex) 
             { 
@@ -1173,7 +1444,7 @@ namespace PowerBI.Services
                 {
                     Console.WriteLine("[DYNAMIC] 403 ERROR: Service Principal requires Premium/Fabric capacity to access dataset metadata/queries.");
                 }
-                Console.WriteLine($"[DYNAMIC] DAX FAIL: {ex.Message}"); 
+                Console.WriteLine($">>>> [FLOW] DAX Error: {ex.Message}"); 
             }
             return results;
         }
@@ -1203,7 +1474,7 @@ namespace PowerBI.Services
                 {
                     foreach (var folder in folders.value)
                     {
-                        if (folder?.displayName?.ToString() == folderName) 
+                        if (folder != null && folder.displayName != null && folder.displayName.ToString() == folderName) 
                         {
                             fabricFolderId = folder.id.ToString();
                             break;
@@ -1322,5 +1593,499 @@ namespace PowerBI.Services
             await client.Reports.DeleteReportInGroupAsync(workspaceId, reportId);
         }
 
+        public async Task DeleteFabricItem(Guid workspaceId, Guid itemId)
+        {
+            Console.WriteLine($"[SERVICE] Deleting Fabric Item {itemId} from Workspace {workspaceId}");
+            var token = await _auth.GetAccessToken();
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            
+            // Use the Folders API specifically for folders, otherwise Items API
+            var url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/folders/{itemId}";
+            Console.WriteLine($"[SERVICE] Fabric FOLDER DELETE Request: {url}");
+            var response = await httpClient.DeleteAsync(url);
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                // Fallback to Items API if it wasn't a folder or if it's a legacy item
+                url = $"https://api.fabric.microsoft.com/v1/workspaces/{workspaceId}/items/{itemId}";
+                Console.WriteLine($"[SERVICE] Falling back to Fabric ITEM DELETE Request: {url}");
+                response = await httpClient.DeleteAsync(url);
+            }
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                Console.WriteLine($"[SERVICE] Fabric Delete Failed ({response.StatusCode}): {error}");
+                throw new Exception($"Fabric API error: {response.StatusCode} - {error}");
+            }
+            Console.WriteLine("[SERVICE] Fabric Item deleted successfully.");
+        }
+
+        public async Task<(bool Success, string Message)> InjectFilterToRdl(int reportId, string fieldName, AppDbContext db)
+        {
+            try
+            {
+                var report = await db.Reports.FindAsync(reportId);
+                if (report == null || report.ReportType != "RDL") return (false, "Not an RDL report");
+
+                Console.WriteLine($">>>> [RDL-INJECT] Starting filter injection for Report '{report.Name}', Field: '{fieldName}'");
+                XDocument xDoc;
+                if (!string.IsNullOrEmpty(report.RdlContent))
+                {
+                    Console.WriteLine(">>>> [RDL-INJECT] Loading RDL source from Database (SQL Storage).");
+                    xDoc = XDocument.Parse(report.RdlContent);
+                }
+                else
+                {
+                    Console.WriteLine(">>>> [RDL-INJECT] RDL Content missing from DB. Falling back to Uploads folder...");
+                    var reportName = report.Name ?? "Unknown";
+                    var fileName = reportName.EndsWith(".rdl", StringComparison.OrdinalIgnoreCase) ? reportName : $"{reportName}.rdl";
+                    var filePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", fileName);
+                    if (!File.Exists(filePath)) 
+                    {
+                        Console.WriteLine($">>>> [RDL-INJECT] ERROR: Source file '{fileName}' missing.");
+                        return (false, "RDL source missing.");
+                    }
+                    xDoc = XDocument.Load(filePath);
+                }
+
+                var ns = xDoc.Root.GetDefaultNamespace();
+
+                // --- INJECT CONNECTION STRING (ONLY FOR SQL) ---
+                string? defaultConn = _config.GetConnectionString("DefaultConnection");
+                if (!string.IsNullOrEmpty(defaultConn))
+                {
+                    foreach (var ds in xDoc.Descendants(ns + "DataSource"))
+                    {
+                        var connProps = ds.Element(ns + "ConnectionProperties");
+                        var provider = connProps?.Element(ns + "DataProvider");
+                        
+                        // Only update if it's already SQL or if it's missing (defaulting to SQL)
+                        // Do NOT touch ENTERDATA as it breaks static reports.
+                        if (provider != null && provider.Value.Contains("SQL", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var connectString = connProps.Element(ns + "ConnectString");
+                            if (connectString == null) { connectString = new XElement(ns + "ConnectString"); connProps.Add(connectString); }
+                            if (connectString.Value != defaultConn)
+                            {
+                                connectString.Value = defaultConn;
+                                Console.WriteLine($">>>> [RDL-INJECT] ConnectionString updated for SQL DataSource '{ds.Attribute("Name")?.Value}'.");
+                            }
+                        }
+                    }
+                }
+
+                // 0. Global Cleanup - REMOVED: Destructive QueryParameters.Remove()
+                // We now handle query parameters per-dataset below.
+
+                var filterDef = await db.ReportFilters.FirstOrDefaultAsync(f => f.ReportId == reportId && f.ColumnName == fieldName);
+                bool isStrict = filterDef?.IsStrict ?? false;
+                Console.WriteLine($">>>> [RDL-INJECT] Mode: {(isStrict ? "STRICT (Query-Level)" : "STANDARD (Dataset-Level)")}");
+
+                // 1. Parameter Injection & Global Nullability Fix
+                var parametersNode = xDoc.Descendants(ns + "ReportParameters").FirstOrDefault();
+                if (parametersNode == null) { parametersNode = new XElement(ns + "ReportParameters"); xDoc.Root.Add(parametersNode); }
+
+                // ENSURE ALL PARAMETERS ARE NULLABLE (Prevents blank screens on first load)
+                foreach (var p in parametersNode.Descendants(ns + "ReportParameter"))
+                {
+                    if (p.Element(ns + "Nullable") == null) p.Add(new XElement(ns + "Nullable", "true"));
+                    else p.Element(ns + "Nullable").Value = "true";
+
+                    if (p.Element(ns + "AllowBlank") == null) p.Add(new XElement(ns + "AllowBlank", "true"));
+                    else p.Element(ns + "AllowBlank").Value = "true";
+                }
+
+                var existingParam = parametersNode.Descendants(ns + "ReportParameter")
+                    .FirstOrDefault(p => p.Attribute("Name")?.Value.Equals(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+
+                string actualParamName = fieldName;
+                if (existingParam == null)
+                {
+                    Console.WriteLine($">>>> [RDL-INJECT] Injecting ReportParameter: '{fieldName}'");
+                    parametersNode.Add(new XElement(ns + "ReportParameter", new XAttribute("Name", fieldName),
+                        new XElement(ns + "DataType", "String"),
+                        new XElement(ns + "Nullable", "true"),
+                        new XElement(ns + "AllowBlank", "true"),
+                        new XElement(ns + "Prompt", fieldName),
+                        new XElement(ns + "Hidden", "false")
+                    ));
+                }
+                else 
+                {
+                    Console.WriteLine($">>>> [RDL-INJECT] ReportParameter '{fieldName}' already exists.");
+                    actualParamName = existingParam.Attribute("Name")?.Value ?? fieldName;
+                }
+
+                // 2. Dataset Injection
+                var datasets = xDoc.Descendants(ns + "DataSet").ToList();
+                foreach (var dataset in datasets)
+                {
+                    var dsName = dataset.Attribute("Name")?.Value;
+                    if (string.IsNullOrEmpty(dsName) || 
+                        dsName.EndsWith("List", StringComparison.OrdinalIgnoreCase) ||
+                        dsName.EndsWith("Values", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    var targetField = dataset.Element(ns + "Fields")?.Elements(ns + "Field")
+                        .FirstOrDefault(f => f.Attribute("Name")?.Value.Equals(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+
+                    if (targetField != null)
+                    {
+                        string actualFieldName = targetField.Attribute("Name")?.Value ?? fieldName;
+
+                        if (isStrict)
+                        {
+                            var queryNode = dataset.Element(ns + "Query");
+                            if (queryNode != null)
+                            {
+                                var queryParams = queryNode.Element(ns + "QueryParameters");
+                                if (queryParams == null) { queryParams = new XElement(ns + "QueryParameters"); queryNode.Add(queryParams); }
+
+                                var existingQP = queryParams.Elements(ns + "QueryParameter")
+                                    .FirstOrDefault(qp => qp.Attribute("Name")?.Value == "@" + actualFieldName);
+                                if (existingQP == null)
+                                {
+                                    Console.WriteLine($">>>> [STRICT-SETUP] Adding QueryParameter '@{actualFieldName}' to DataSet '{dsName}'.");
+                                    queryParams.Add(new XElement(ns + "QueryParameter", new XAttribute("Name", "@" + actualFieldName),
+                                        new XElement(ns + "Value", $"=Parameters!{actualParamName}.Value")));
+                                }
+
+                                var cmdText = queryNode.Element(ns + "CommandText");
+                                if (cmdText != null && !cmdText.Value.Contains("ENTERDATA"))
+                                {
+                                    string sql = cmdText.Value;
+                                    string clause = sql.Contains("WHERE", StringComparison.OrdinalIgnoreCase) ? $" AND {actualFieldName} = @{actualFieldName}" : $" WHERE {actualFieldName} = @{actualFieldName}";
+                                    if (!sql.Contains($"@{actualFieldName}")) 
+                                    {
+                                        cmdText.Value = sql + clause;
+                                        Console.WriteLine($">>>> [STRICT-SETUP] SQL Query modified with WHERE clause for field '{actualFieldName}'.");
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // --- DATASET FILTER INJECTION ---
+                            var filters = dataset.Element(ns + "Filters");
+                            if (filters == null) { filters = new XElement(ns + "Filters"); dataset.Add(filters); }
+
+                            // Remove existing filters for this parameter to avoid duplicates
+                            filters.Elements(ns + "Filter")
+                                .Where(f => f.Element(ns + "FilterExpression")?.Value.Contains($"Parameters!{actualParamName}.Value") == true)
+                                .Remove();
+
+                            // Simplified but powerful expression: 
+                            // If Parameter is blank/null/ALL, it matches everything (Field = Field).
+                            // Otherwise, it matches the specific value.
+                            string fieldRef = $"Fields!{actualFieldName}.Value";
+                            string paramRef = $"Parameters!{actualParamName}.Value";
+                            
+                            Console.WriteLine($">>>> [UNIVERSAL-SYNC] Applying filter to DataSet '{dsName}' for field '{actualFieldName}'");
+                            
+                            filters.Add(new XElement(ns + "Filter",
+                                new XElement(ns + "FilterExpression", $"={fieldRef}"),
+                                new XElement(ns + "Operator", "Equal"),
+                                new XElement(ns + "FilterValues", new XElement(ns + "FilterValue", 
+                                    $"=IIf({paramRef} = \"\" OR {paramRef} IS NOTHING OR {paramRef} = \"ALL\", {fieldRef}, {paramRef})"))));
+                        }
+                    }
+                }
+
+                // --- LAYOUT CLEANUP (CRITICAL for Power BI Sync) ---
+                // We must remove the layout grid before saving/uploading so Power BI can auto-regenerate it 
+                // to match our new parameter count. Otherwise, upload fails with rsInvalidParameterLayoutCellDefNotEqualsParameterCount.
+                var layout = xDoc.Descendants(ns + "ReportParametersLayout").FirstOrDefault();
+                if (layout != null) 
+                {
+                    Console.WriteLine(">>>> [RDL-INJECT] Removing stale Parameter Layout grid to force regeneration.");
+                    layout.Remove();
+                }
+
+                // --- SAVE RESULTS TO DATABASE ---
+                Console.WriteLine(">>>> [RDL-INJECT] Saving updated RDL Content to Database.");
+                report.RdlContent = xDoc.ToString();
+                db.Reports.Update(report);
+                await db.SaveChangesAsync();
+
+                Console.WriteLine(">>>> [RDL-INJECT] Injection process COMPLETED.");
+                return (true, "Success");
+            }
+            catch (Exception ex) { return (false, ex.Message); }
+        }
+
+        public async Task PatchReportCredentials(Guid workspaceId, Guid reportId)
+        {
+            try
+            {
+                var client = await GetClient();
+                Console.WriteLine($">>>> [PATCH] Starting Credential Patching for Report: {reportId}");
+                
+                var report = await client.Reports.GetReportInGroupAsync(workspaceId, reportId);
+                var datasources = await client.Reports.GetDatasourcesInGroupAsync(workspaceId, reportId);
+                
+                string? datasetId = report.DatasetId;
+
+                // --- RDL DATASET DISCOVERY FALLBACK ---
+                if (string.IsNullOrEmpty(datasetId))
+                {
+                    var allDatasets = await client.Datasets.GetDatasetsInGroupAsync(workspaceId);
+                    var match = allDatasets.Value.FirstOrDefault(d => d.Name == report.Name || d.Name == report.Name + ".rdl");
+                    datasetId = match?.Id;
+                }
+
+                // --- AZURE-IT-SPEC: Smart Discovery ---
+                if (datasources.Value == null || !datasources.Value.Any())
+                {
+                    var localPath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "uploads", report.Name.EndsWith(".rdl") ? report.Name : report.Name + ".rdl");
+                    if (File.Exists(localPath))
+                    {
+                        var xDoc = XElement.Load(localPath);
+                        var ns = xDoc.GetDefaultNamespace();
+                        var dsName = xDoc.Descendants(ns + "DataSource").FirstOrDefault()?.Attribute("Name")?.Value;
+                        var provider = xDoc.Descendants(ns + "DataProvider").FirstOrDefault()?.Value;
+                        
+                        if (!string.IsNullOrEmpty(dsName))
+                        {
+                            if (provider != null && provider.Contains("ENTERDATA"))
+                            {
+                                Console.WriteLine($">>>> [PATCH] SKIP: DataSource '{dsName}' is Static XML (ENTERDATA).");
+                            }
+                            else
+                            {
+                                dynamic syntheticDs = new System.Dynamic.ExpandoObject();
+                                syntheticDs.Name = dsName;
+                                syntheticDs.DatasourceType = "Sql";
+                                await AttemptAutoGatewayBinding(workspaceId, reportId, datasetId, syntheticDs);
+                            }
+                        }
+                    }
+                }
+                else 
+                {
+                    foreach (var reportDs in datasources.Value)
+                    {
+                        await AttemptAutoGatewayBinding(workspaceId, reportId, datasetId, reportDs);
+                    }
+                }
+                Console.WriteLine(">>>> [PATCH] Process COMPLETED.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($">>>> [PATCH] FAILED: {ex.Message}");
+            }
+        }
+
+        public class GatewayBindingResult
+        {
+            public bool Success { get; set; }
+            public string? GatewayId { get; set; }
+            public string? DatasourceId { get; set; }
+        }
+
+        private async Task<List<GatewayBindingResult>> FindAllMatchingGatewayDatasources(Guid workspaceId, string server, string db)
+        {
+            var results = new List<GatewayBindingResult>();
+            try
+            {
+                var client = await GetClient();
+                var gateways = await client.Gateways.GetGatewaysAsync();
+                foreach (var gateway in gateways.Value ?? new List<Microsoft.PowerBI.Api.Models.Gateway>())
+                {
+                    var gwDatasources = await client.Gateways.GetDatasourcesAsync(gateway.Id);
+                    foreach (var gds in gwDatasources.Value)
+                    {
+                        if (gds.DatasourceType == "Sql")
+                        {
+                            string gwConn = (gds.ConnectionDetails ?? "").Replace("\\\\", "\\");
+                            if (gwConn.Contains(server, StringComparison.OrdinalIgnoreCase) && 
+                                gwConn.Contains(db, StringComparison.OrdinalIgnoreCase))
+                            {
+                                results.Add(new GatewayBindingResult { 
+                                    Success = true, 
+                                    GatewayId = gateway.Id.ToString(), 
+                                    DatasourceId = gds.Id.ToString() 
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return results;
+        }
+
+        private async Task<GatewayBindingResult> AttemptAutoGatewayBinding(Guid workspaceId, Guid reportId, string? datasetId, dynamic? reportDs)
+        {
+            try
+            {
+                // Fallback: If datasetId is null, some APIs allow using reportId for binding RDLs
+                string targetId = datasetId ?? reportId.ToString();
+                
+                var client = await GetClient();
+                Console.WriteLine($">>>> [GATEWAY] Attempting binding for Target ID: {targetId}");
+
+                var gateways = await client.Gateways.GetGatewaysAsync();
+                if (gateways.Value == null || !gateways.Value.Any())
+                {
+                    Console.WriteLine(">>>> [GATEWAY] WARNING: The Service Principal has NO access to any Gateways. Please add the App ID to the 'Manage Users' section of the Gateway in Power BI Portal.");
+                }
+                else
+                {
+                    Console.WriteLine($">>>> [GATEWAY] Service Principal has access to {gateways.Value.Count} Gateway(s). Scanning for matches...");
+                }
+
+                foreach (var gateway in gateways.Value ?? new List<Microsoft.PowerBI.Api.Models.Gateway>())
+                {
+                    Console.WriteLine($">>>> [GATEWAY] Checking Gateway Cluster: '{gateway.Name}' ({gateway.Id})");
+                    var gwDatasources = await client.Gateways.GetDatasourcesAsync(gateway.Id);
+                    
+                    Console.WriteLine($">>>> [GATEWAY]   Found {gwDatasources.Value?.Count ?? 0} connections on this cluster.");
+                    foreach (var gds in gwDatasources.Value)
+                    {
+                        Console.WriteLine($">>>> [GATEWAY]   - Connection: '{gds.DatasourceName}' (Type: {gds.DatasourceType})");
+                        
+                        string targetServer = "___";
+                        string targetDb = "___";
+                        bool match = false;
+
+                        if (gds.DatasourceType == "Sql")
+                        {
+                            if (reportDs != null)
+                            {
+                                try { targetServer = (reportDs.ConnectionDetails?.Server ?? "___").Replace("\\\\", "\\"); } catch { }
+                                try { targetDb = (reportDs.ConnectionDetails?.Database ?? "___").Replace("\\\\", "\\"); } catch { }
+                            }
+
+                            // CRITICAL FALLBACK: If we still have underscores, use our known local server
+                            if (targetServer == "___") targetServer = "zsdeskt8ibnl5\\sqlexpress";
+                            if (targetDb == "___") targetDb = "powerBIdemo";
+
+                            string gwConn = (gds.ConnectionDetails ?? "").Replace("\\\\", "\\");
+                            
+                            Console.WriteLine($">>>> [GATEWAY]     Comparing: Target(Server={targetServer}, DB={targetDb}) vs GatewayDetails({gwConn})");
+                            
+                            match = gwConn.Contains(targetServer, StringComparison.OrdinalIgnoreCase) &&
+                                    gwConn.Contains(targetDb, StringComparison.OrdinalIgnoreCase);
+                            
+                            // Secondary Match: Flexible name match
+                            if (!match && gwConn.Contains(targetServer, StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (gds.DatasourceName.Contains("PowerBI", StringComparison.OrdinalIgnoreCase) || 
+                                    gds.DatasourceName.Contains("Demo", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    Console.WriteLine($">>>> [GATEWAY] ALERT: DB name mismatch, but Server and Connection Name match. Proceeding...");
+                                    match = true;
+                                }
+                            }
+                        }
+
+                        if (match)
+                        {
+                            Console.WriteLine($">>>> [GATEWAY] MATCH CONFIRMED: Gateway='{gateway.Name}', Connection='{gds.DatasourceName}'");
+                            
+                            // [SYNC] Force exact casing from Gateway to avoid 404/403 data source errors
+                            try 
+                            {
+                                if (!string.IsNullOrEmpty(gds.ConnectionDetails))
+                                {
+                                    var gwDetails = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(gds.ConnectionDetails);
+                                    if (gwDetails.TryGetProperty("server", out var sProp)) targetServer = sProp.GetString() ?? targetServer;
+                                    if (gwDetails.TryGetProperty("database", out var dProp)) targetDb = dProp.GetString() ?? targetDb;
+                                    Console.WriteLine($">>>> [GATEWAY] SYNC: Using Gateway Casing -> Server: {targetServer}, DB: {targetDb}");
+                                }
+                            } catch { }
+                            
+                            // [AZURE-IT-SPEC] - Raw REST API Fallback to bypass SDK version issues
+                            try 
+                            {
+                                Console.WriteLine(">>>> [GATEWAY] Sending Raw REST API request for RDL Binding...");
+                                var token = await _auth.GetAccessToken();
+                                using (var httpClient = new System.Net.Http.HttpClient())
+                                {
+                                    httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                                    
+                                    // Parse the connection details string into a real object so it's not double-serialized
+                                    object? connObj = null;
+                                    try { 
+                                        if (!string.IsNullOrEmpty(gds.ConnectionDetails))
+                                            connObj = System.Text.Json.JsonSerializer.Deserialize<object>(gds.ConnectionDetails); 
+                                        else
+                                            connObj = new { };
+                                    }
+                                    catch { connObj = gds.ConnectionDetails ?? (object)new { }; }
+
+                                    var payload = new
+                                    {
+                                        updateDetails = new[]
+                                        {
+                                            new
+                                            {
+                                                datasourceName = (string)(reportDs?.Name ?? "DataSource"),
+                                                gatewayId = gateway.Id.ToString(),
+                                                datasourceId = gds.Id.ToString(),
+                                                connectionDetails = new {
+                                                    server = targetServer,
+                                                    database = targetDb
+                                                }
+                                            }
+                                        }
+                                    };
+
+                                    var json = System.Text.Json.JsonSerializer.Serialize(payload, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                                    Console.WriteLine($">>>> [GATEWAY] Sending Payload:\n{json}");
+
+                                    var content = new System.Net.Http.StringContent(json, System.Text.Encoding.UTF8, "application/json");
+                                    
+                                    var url = $"https://api.powerbi.com/v1.0/myorg/groups/{workspaceId}/reports/{reportId}/Default.UpdateDatasources";
+                                    var response = await httpClient.PostAsync(url, content);
+                                    
+                                    if (response.IsSuccessStatusCode)
+                                    {
+                                        Console.WriteLine(">>>> [GATEWAY] SUCCESS: RDL bound via Raw REST API.");
+                                        return new GatewayBindingResult { Success = true, GatewayId = gateway.Id.ToString(), DatasourceId = gds.Id.ToString() };
+                                    }
+                                    else
+                                    {
+                                        var error = await response.Content.ReadAsStringAsync();
+                                        Console.WriteLine($">>>> [GATEWAY] FAILED: {error}");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($">>>> [GATEWAY] ERROR: {ex.Message}");
+                            }
+
+                            // Dataset Binding Fallback (Standard Power BI)
+                            if (!string.IsNullOrEmpty(datasetId))
+                            {
+                                try {
+                                    var bindRequest = new Microsoft.PowerBI.Api.Models.BindToGatewayRequest(gateway.Id, new List<Guid?> { gds.Id });
+                                    await client.Datasets.BindToGatewayInGroupAsync(workspaceId, datasetId, bindRequest);
+                                    Console.WriteLine($">>>> [GATEWAY] SUCCESS: Bound via Dataset API fallback.");
+                                    return new GatewayBindingResult { Success = true, GatewayId = gateway.Id.ToString(), DatasourceId = gds.Id.ToString() };
+                                } catch { /* Ignore dataset errors if RDL */ }
+                            }
+                        }
+                    }
+                }
+
+                // --- FALLTHROUGH: CLOUD PATCHING ---
+                if (reportDs != null && (string)reportDs.DatasourceType == "Sql")
+                {
+                    Console.WriteLine(">>>> [GATEWAY] No gateway match. Attempting Cloud Credential Patching...");
+                }
+                
+                Console.WriteLine(">>>> [GATEWAY] No matching gateway connection found.");
+                return new GatewayBindingResult { Success = false };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($">>>> [GATEWAY] ERROR: {ex.Message}");
+                return new GatewayBindingResult { Success = false };
+            }
+        }
+
     }
-}
+}

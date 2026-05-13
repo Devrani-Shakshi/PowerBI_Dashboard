@@ -9,6 +9,8 @@ namespace PowerBI.Models
         public int WorkspaceId { get; set; }
         public int? FolderId { get; set; }
         public string? FilePath { get; set; }
+        public int? CreatedByUserId { get; set; }
         public string? ReportType { get; set; } // "PowerBI" or "RDL"
+        public string? RdlContent { get; set; }
     }
 }

@@ -35,6 +35,7 @@ namespace PowerBI.Controllers
 
             Console.WriteLine($"[AUTH] Login successful. User: {user.Name} (ID: {user.Id}, Role: {user.Role})");
             HttpContext.Session.SetInt32("UserId", user.Id);
+            HttpContext.Session.SetString("UserRole", user.Role ?? "User");
 
             return RedirectToAction("Index", "Workspace");
         }

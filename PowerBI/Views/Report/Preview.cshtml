@@ -174,8 +174,9 @@
 <div class="modal fade" id="manualFilterModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content border-0 shadow-lg" style="border-radius: 1rem;">
-            <div class="modal-header border-0 pb-0">
-                <h5 class="modal-title fw-bold">Add Custom Filter</h5>
+            <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+                <h6 class="mb-0 fw-bold">Metadata & Filters</h6>
+                <span class="badge bg-light text-dark extra-small border">User ID: @Context.Session.GetInt32("UserId")</span>
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
@@ -204,130 +205,221 @@
 
 @section Scripts {
     <script>
-        let report;
-        const datasetId = '@Model.DatasetId';
-        const reportType = '@Model.ReportType';
+        const reportType = '@Model.ReportType' === 'PaginatedReport' ? 'RDL' : '@Model.ReportType';
+        const datasetId = (reportType === 'RDL') ? null : '@Model.DatasetId';
         const localReportId = '@Model.LocalReportId';
         const pbiWorkspaceId = '@Model.WorkspaceId';
+        const pbiReportId = '@Model.ReportId';
         let activeFilters = {}; // Key: "Table/Column", Value: [values]
         let availableFilters = [];
 
-        let embedUrl = '@Model.EmbedUrl';
-        
-        // TenantId will be injected dynamically by applyAllFilters()
-        // only if the report actually has a TenantId parameter.
+        // Fix for :tabbable error in Power BI RDL SDK conflicts
+        if ($.expr && $.expr[':']) {
+            $.expr[':'].tabbable = function(el) {
+                var nodeName = el.nodeName.toLowerCase();
+                var isTabIndexNotNaN = !isNaN($.attr(el, 'tabindex'));
+                return (/^(input|select|textarea|button|object)$/.test(nodeName) ?
+                    !el.disabled :
+                    'a' === nodeName ?
+                        el.href || isTabIndexNotNaN :
+                        isTabIndexNotNaN
+                ) && $(el).is(':visible');
+            };
+        }
 
-        const config = {
-            type: 'report',
-            tokenType: 1, 
-            accessToken: '@Model.EmbedToken',
-            embedUrl: embedUrl,
-            id: '@Model.ReportId',
-            settings: {
-                panes: {
-                    filters: { visible: false }, 
-                    pageNavigation: { visible: true, position: 0 }
-                }
-            }
-        };
+        let report;
+        let secureUrl = '';
+        let config;
 
         $(document).ready(function () {
             const container = $('#reportContainer')[0];
+            const baseEmbedUrl = '@Html.Raw(Model.EmbedUrl)';
+            
+            if (!baseEmbedUrl || baseEmbedUrl === 'undefined' || baseEmbedUrl === '') {
+                console.error("[CRITICAL] Cannot initialize frame. Model.EmbedUrl is empty or undefined.");
+                $('#reportContainer').html('<div class="alert alert-danger">Configuration Error: Secure Embed URL is missing.</div>');
+                return;
+            }
+
+            // Force /rdlEmbed to bypass standard report telemetry
+            secureUrl = baseEmbedUrl.replace('/reportEmbed', '/rdlEmbed');
+            const reportTypeLocal = '@Model.ReportType';
+            
+
+            config = {
+                type: 'report', 
+                id: '@Model.ReportId',
+                embedUrl: secureUrl,
+                accessToken: '@Model.EmbedToken',
+                tokenType: 1, // models.TokenType.Embed
+                settings: {
+                    commands: {
+                        parameterPanel: { enabled: false }
+                    }
+                }
+            };
+
+            console.log("[PREVIEW] Final Embed Config:", {
+                reportId: config.id,
+                tokenType: config.tokenType,
+                url: config.embedUrl
+            });
+
+            console.log("[PREVIEW] Resetting container...");
+            
+            console.log("[PREVIEW] Document Ready. Resetting container...");
+            // RESET: Wipe any cached session state from the DOM wrapper
+            powerbi.reset(container);
+            
+            console.log("[PREVIEW] Calling powerbi.embed()...");
             report = powerbi.embed(container, config);
 
+            // DIAGNOSTICS: Catch RDL specific rendering errors
+            report.on('error', function (event) {
+                console.error("[POWERBI-SDK-ERROR]", event.detail);
+                if (event.detail.message && event.detail.message.includes("403")) {
+                    Swal.fire({
+                        icon: 'error',
+                        title: 'Access Denied',
+                        text: 'The report dataset requires a Premium capacity or Gateway binding.',
+                        confirmButtonColor: '#0d6efd'
+                    });
+                }
+            });
+
             report.on("loaded", async () => {
-                console.log("[PREVIEW] Report loaded. Discovering filters...");
+                console.log("[PREVIEW] Report Event: LOADED");
                 await loadFilters();
             });
 
+            report.on("rendered", function () {
+                console.log("[PREVIEW] Report Event: RENDERED");
+                Toast.fire({ icon: 'success', title: 'Report rendered successfully' });
+            });
+
             report.on("error", function (event) {
-                console.error("[PREVIEW] Report Error Detail:", event.detail);
-                if (event.detail.message) {
-                    alert("Power BI Error: " + event.detail.message);
+                console.error("[PREVIEW] Report Event: ERROR", event.detail);
+                if (event.detail.message && event.detail.message.includes("403")) {
+                    Swal.fire({
+                        icon: 'error',
+                        title: 'Access Denied',
+                        text: 'The report dataset requires a Premium capacity or Gateway binding.',
+                        confirmButtonColor: '#0d6efd'
+                    });
                 }
             });
         });
 
         async function loadFilters() {
-            if (!datasetId && reportType !== 'RDL') {
-                $('#filterArea').html('<p class="text-muted text-center py-5">No dataset schema available.</p>');
-                return;
-            }
+            const filterArea = $('#filterArea');
+            // Clear current filters to avoid "redundant" skips during sync
+            filterArea.empty();
+            activeFilters = {}; 
 
             try {
-                let url = `/Report/GetDatasetSchema?datasetId=${datasetId}`;
-                
-                // RDL reports don't have datasets; they have parameters in our DB
-                if (reportType === 'RDL') {
-                    url = `/Report/GetFilters?reportId=${localReportId}`;
-                }
-
+                let url = `/Report/GetFilters?reportId=${localReportId}`;
                 const response = await fetch(url);
-                const data = await response.json();
+                const filters = await response.json();
                 
-                if (!response.ok) {
-                    $('#filterLoader').hide();
-                    $('#filterArea').html(`
-                        <div class="alert alert-info p-3 m-2 small shadow-sm" style="border-radius: 10px; background: rgba(13, 110, 253, 0.05); border: 1px solid rgba(13, 110, 253, 0.1);">
-                            <h6 class="fw-bold mb-1 text-primary"><i class="bi bi-cpu-fill me-2"></i>Smart Discovery</h6>
-                            <p class="mb-2 text-dark" style="font-size: 0.8rem;">Automatic scan is restricted. Use the Smart Scanner to read fields directly from your charts.</p>
-                            <button onclick="runSmartScan()" id="scanBtn" class="btn btn-sm btn-primary w-100 fw-bold">
-                                <i class="bi bi-search me-2"></i>Scan Report Visuals
-                            </button>
-                        </div>
-                        <div id="manualFilterArea"></div>
-                    `);
+                availableFilters = filters; // Store globally for RDL param handling
+                console.log("[PREVIEW] Loaded filters:", filters);
+
+                if (!filters || filters.length === 0) {
+                    if (reportType === 'RDL') {
+                        filterArea.html(`
+                            <div class="alert alert-info p-3 m-2 small shadow-sm" style="border-radius: 10px; background: rgba(13, 110, 253, 0.05); border: 1px solid rgba(13, 110, 253, 0.1);">
+                                <h6 class="fw-bold mb-1 text-primary"><i class="bi bi-cpu-fill me-2"></i>Parameter Sync</h6>
+                                <p class="mb-2 text-dark" style="font-size: 0.8rem;">No parameters discovered for this RDL report.</p>
+                                <button onclick="discoverRdlParameters()" id="scanBtn" class="btn btn-sm btn-primary w-100 fw-bold">
+                                    <i class="bi bi-arrow-repeat me-2"></i>Sync Parameters
+                                </button>
+                            </div>
+                        `);
+                        // Auto-trigger for RDL if empty
+                        console.log("[PREVIEW] Auto-triggering RDL parameter discovery...");
+                        setTimeout(() => discoverRdlParameters(), 500);
+                    } else {
+                        filterArea.html(`
+                            <div class="alert alert-info p-3 m-2 small shadow-sm" style="border-radius: 10px; background: rgba(13, 110, 253, 0.05); border: 1px solid rgba(13, 110, 253, 0.1);">
+                                <h6 class="fw-bold mb-1 text-primary"><i class="bi bi-cpu-fill me-2"></i>Smart Discovery</h6>
+                                <p class="mb-2 text-dark" style="font-size: 0.8rem;">No filters found for this user.</p>
+                                <button onclick="runSmartScan()" id="scanBtn" class="btn btn-sm btn-primary w-100 fw-bold">
+                                    <i class="bi bi-search me-2"></i>Scan Report
+                                </button>
+                            </div>
+                        `);
+                    }
                     return;
                 }
 
-                availableFilters = data;
-                $('#filterLoader').hide();
-                const filterArea = $('#filterArea');
-                
-                // Only show top 8 columns to keep it clean, prioritized by common names
-                // Sort columns: prioritize common names like 'date', 'month', etc.
-                const prioritizedSchema = availableFilters.sort((a, b) => {
-                    const colA = (a.columnName || a.column || "").toLowerCase();
-                    const colB = (b.columnName || b.column || "").toLowerCase();
-                    const keywords = ['date', 'month', 'category', 'gender', 'region', 'status'];
-                    const aScore = keywords.some(k => colA.includes(k)) ? 0 : 1;
-                    const bScore = keywords.some(k => colB.includes(k)) ? 0 : 1;
-                    return aScore - bScore;
-                }).slice(0, 15);
+                // Group by Custom vs System
+                const systemFilters = filters.filter(f => !f.isCustom);
+                const customFilters = filters.filter(f => f.isCustom);
 
-                for (let field of availableFilters) {
-                    // Map database property names to local names if needed
-                    const table = field.tableName || field.table;
-                    const column = field.columnName || field.column;
-
-                    // HIDE SECURITY PARAMETERS FROM UI
-                    if (column === 'TenantId') continue;
-
-                    const group = $(`
-                        <div class="filter-group" data-table="${table}" data-column="${column}">
-                            <div class="filter-group-header" onclick="$(this).next().slideToggle()">
-                                <span>${column}</span>
-                                <i class="bi bi-chevron-down small"></i>
-                            </div>
-                            <div class="filter-group-content">
-                                <div class="text-center p-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>
-                            </div>
-                        </div>
-                    `);
-                    filterArea.append(group);
-                    
-                    // Lazy load values for each column
-                    loadColumnValues(table, column, group.find('.filter-group-content'));
+                if (systemFilters.length > 0) {
+                    filterArea.append('<div class="px-3 py-1 bg-light text-uppercase fw-bold text-muted border-bottom mb-2" style="font-size: 0.65rem; letter-spacing: 0.05rem;">Report Parameters</div>');
+                    systemFilters.forEach(f => addFilterGroup(f));
                 }
-            } catch (err) {
-                console.error("Filter Load Error:", err);
+
+                if (customFilters.length > 0) {
+                    filterArea.append('<div class="px-3 py-1 bg-light text-uppercase fw-bold text-muted border-bottom mt-3 mb-2" style="font-size: 0.65rem; letter-spacing: 0.05rem;">My Custom Filters</div>');
+                    customFilters.forEach(f => addFilterGroup(f));
+                }
+
+                // AUTO-APPLY for RDL on first load to satisfy engine dependencies
+                if (reportType === 'RDL' && !window.initialRdlApplied) {
+                    console.log("[PREVIEW] Initial RDL Parameter Injection...");
+                    window.initialRdlApplied = true;
+                    setTimeout(() => applySidebarFilters(), 500);
+                }
+            } catch (error) {
+                console.error("[PREVIEW] Load Filters Error:", error);
+                filterArea.html('<div class="p-3 text-danger small">Error loading filters.</div>');
             }
+        }
+
+        function addFilterGroup(field) {
+            // Handle both camelCase and PascalCase from API
+            const table = field.tableName || field.TableName || field.table;
+            const column = field.columnName || field.ColumnName || field.column;
+            const id = field.id || field.Id;
+
+            if (column === 'TenantId') return;
+
+            // --- PREVENT DUPLICATION ---
+            const isDuplicate = $(`[data-column="${column}"]`).length > 0;
+            if (isDuplicate && table !== 'RDL_PARAMETER') {
+                console.log(`[PREVIEW] Skipping redundant filter UI for: ${column}`);
+                return;
+            }
+
+            console.log(`[PREVIEW] Adding filter group: ${table}.${column}`);
+
+            const group = $(`
+                <div class="filter-group mb-2 border rounded shadow-sm bg-white" data-table="${table}" data-column="${column}">
+                    <div class="filter-group-header p-2 d-flex justify-content-between align-items-center cursor-pointer bg-light">
+                        <span class="fw-bold small text-dark" onclick="$(this).parent().next().slideToggle()">${column}</span>
+                        <div class="d-flex align-items-center gap-2">
+                            <i class="bi bi-trash text-danger cursor-pointer extra-small" onclick="deleteFilter(${id}, this)" title="Remove Filter"></i>
+                            <i class="bi bi-chevron-down small" onclick="$(this).parent().parent().next().slideToggle()"></i>
+                        </div>
+                    </div>
+                    <div class="filter-group-content p-2" style="display:none; max-height: 200px; overflow-y: auto;">
+                        <div class="text-center p-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>
+                    </div>
+                </div>
+            `);
+
+            $('#filterArea').append(group);
+            
+            // Lazy load values
+            loadColumnValues(table, column, group.find('.filter-group-content'));
         }
 
         async function loadColumnValues(table, column, container) {
             try {
-                // IMPORTANT: Use reportId (GUID) not localReportId (Integer) for the Power BI API
-                let url = `/Report/GetFilterValues?datasetId=${datasetId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&reportId=@Model.ReportId&workspaceId=${pbiWorkspaceId}`;
+                // ENTERPRISE: Use internal localReportId. Backend will resolve the active runtime session ID.
+                let url = `/Report/GetFilterValues?localReportId=${localReportId}&table=${encodeURIComponent(table)}&column=${encodeURIComponent(column)}&datasetId=${datasetId}`;
                 const response = await fetch(url);
                 const values = await response.json();
                 
@@ -350,7 +442,7 @@
                         <p class="text-muted small mb-2"><i class="bi bi-info-circle me-1"></i>Type value to filter:</p>
                         <div class="input-group input-group-sm">
                             <input type="text" class="form-control" placeholder="e.g. June" id="manual_val_${table}_${column}">
-                            <button class="btn btn-primary" onclick="applyManualValue('${table}', '${column}')">Apply</button>
+                            <button class="btn btn-primary" onclick="applySidebarFilters()">Apply</button>
                         </div>
                     </div>
                 `);
@@ -377,73 +469,82 @@
                 activeFilters[key] = activeFilters[key].filter(v => v !== value);
             }
 
-            await applyAllFilters();
+            await applySidebarFilters();
         }
 
-        async function applyAllFilters() {
-            console.log("[PREVIEW] applyAllFilters called. reportType is:", reportType);
+        async function applySidebarFilters() {
+            console.log("[PREVIEW] applySidebarFilters triggered for Type:", reportType);
             
-            if (reportType === 'RDL' || reportType === 'PaginatedReport') {
+            if (reportType === 'RDL') {
                 const rdlParameters = [];
                 
-                // 1. Collect Active UI Filters
+                // 1. Collect from checkbox state
                 for (const key in activeFilters) {
-                    const [table, column] = key.split('/');
+                    const [table, col] = key.split('/');
                     const values = activeFilters[key];
-                    if (values && values.length > 0) {
-                        rdlParameters.push({
-                            name: column,
-                            value: values[0] 
-                        });
+                    if (values && values.length > 0 && values[0] !== "" && values[0] !== "ALL") {
+                        rdlParameters.push({ name: col, value: values[0] });
                     }
                 }
 
-                // 2. Ensure Background Security Parameter (TenantId)
-                if (!rdlParameters.find(p => p.name === 'TenantId')) {
-                    const hasTenantIdParam = availableFilters.some(f => (f.columnName || f.column) === 'TenantId');
-                    if (hasTenantIdParam) {
-                        rdlParameters.push({ name: 'TenantId', value: 'PROD-TENANT-001' });
+                // 2. Collect from manual input fields
+                availableFilters.forEach(f => {
+                    const col = f.columnName || f.column;
+                    const manualVal = $(`#manual_val_${f.tableName}_${col}`).val();
+                    if (manualVal && manualVal !== "" && manualVal !== "ALL" && !rdlParameters.find(p => p.name === col)) {
+                        rdlParameters.push({ name: col, value: manualVal });
                     }
-                }
+                });
 
-                console.log("[PREVIEW] Applying RDL Parameters via URL:", rdlParameters);
-                
                 try {
-                    // Build URL with rp: parameters (most reliable for Paginated Reports)
-                    let finalUrl = '@Model.EmbedUrl';
-                    let separator = finalUrl.includes('?') ? '&' : '?';
+                    const urlObj = new URL(secureUrl);
+                    const params = new URLSearchParams(urlObj.search);
                     
-                    for (const p of rdlParameters) {
-                        if (p.value) {
-                            finalUrl += `${separator}rp:${encodeURIComponent(p.name)}=${encodeURIComponent(p.value)}`;
-                            separator = '&';
-                        }
-                    }
+                    // Clear existing rp: parameters to prevent bloating
+                    const keysToDelete = [];
+                    params.forEach((v, k) => { if (k.startsWith('rp:')) keysToDelete.push(k); });
+                    keysToDelete.forEach(k => params.delete(k));
 
-                    console.log("[PREVIEW] Final Embed URL:", finalUrl);
+                    // Inject new rp: parameters
+                    rdlParameters.forEach(p => {
+                        console.log(`[RDL-FILTER] Injecting: rp:${p.name} = ${p.value}`);
+                        params.set(`rp:${p.name}`, p.value);
+                    });
 
-                    const updatedConfig = {
-                        ...config,
-                        embedUrl: finalUrl
+                    params.set('rdl:parameterPanel', 'collapsed');
+                    // CRITICAL: Power BI RDL parameters require literal colons, not encoded %3A
+                    urlObj.search = params.toString().replace(/%3A/g, ':');
+
+                    const rdlConfig = { 
+                        ...config, 
+                        embedUrl: urlObj.toString()
                     };
                     
-                    // Re-embed with new URL
+                    // Ensure NO datasetId in RDL config
+                    delete rdlConfig.datasetId;
+
+                    console.log("[RDL-FILTER] Final RDL URL:", rdlConfig.embedUrl);
+
                     powerbi.reset($('#reportContainer')[0]);
-                    report = powerbi.embed($('#reportContainer')[0], updatedConfig);
+                    report = powerbi.embed($('#reportContainer')[0], rdlConfig);
                     
-                    console.log("[PREVIEW] URL Re-embed triggered.");
+                    Toast.fire({ icon: 'success', title: `Applied ${rdlParameters.length} active parameter(s)` });
                 } catch (e) {
-                    console.error("[PREVIEW] Failed to apply RDL parameters:", e);
+                    console.error("[RDL-FILTER] Error:", e);
                 }
                 return;
             }
 
+            // Fallback for PBIX reports (Standard Apply)
+            await applyAllFilters();
+        }
+
+        async function applyAllFilters() {
+            // Power BI (PBIX) Filter Logic
             const pbiFilters = [];
-            
             for (const key in activeFilters) {
                 const [table, column] = key.split('/');
                 const values = activeFilters[key];
-                
                 if (values.length > 0) {
                     pbiFilters.push({
                         $schema: "http://powerbi.com/product/schema#basic",
@@ -453,15 +554,44 @@
                     });
                 }
             }
-
-            console.log("[PREVIEW] Applying Filters:", pbiFilters);
-            await report.setFilters(pbiFilters);
+            try {
+                await report.setFilters(pbiFilters);
+                Toast.fire({ icon: 'success', title: 'Filter applied successfully!' });
+            } catch (err) {
+                console.error("[PREVIEW] PBI Filter Error:", err);
+            }
         }
 
         async function clearAllFilters() {
+            console.log("[PREVIEW] Clearing all filters...");
             $('input[type="checkbox"]').prop('checked', false);
+            $('input[type="text"]').val(''); // Clear manual inputs
             activeFilters = {};
-            await report.removeFilters();
+            
+            if (reportType === 'RDL' || reportType === 'PaginatedReport') {
+                // For RDL, we must reload the original URL to clear parameters
+                console.log("[SINGLE-REPORT] Resetting RDL view...");
+                
+                const urlObj = new URL(embedUrl);
+                const params = new URLSearchParams(urlObj.search);
+                params.set('rdl:parameterPanel', 'collapsed'); // Keep panel closed
+                
+                // Ensure base parameters are cleared in the URL
+                urlObj.search = params.toString();
+                
+                const resetConfig = {
+                    ...config,
+                    embedUrl: urlObj.toString()
+                };
+
+                powerbi.reset($('#reportContainer')[0]);
+                report = powerbi.embed($('#reportContainer')[0], resetConfig);
+            } else {
+                // For standard PBIX
+                await report.removeFilters();
+            }
+            
+            Toast.fire({ icon: 'info', title: 'Filters cleared.' });
         }
 
         function searchFilters(query) {
@@ -523,6 +653,12 @@
         }
 
         async function runSmartScan() {
+            if (reportType === 'RDL') {
+                console.log("[PREVIEW] RDL detected. Redirecting Smart Scan to Parameter Discovery.");
+                await discoverRdlParameters();
+                return;
+            }
+
             const btn = $('#scanBtn');
             const original = btn.html();
             btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Scanning...');
@@ -547,10 +683,26 @@
                 if (fieldsFound.size === 0) {
                     alert("No active fields discovered. Please interact with the report visuals first, or click 'Add manually' to type a field name.");
                 } else {
-                    fieldsFound.forEach(fieldKey => {
-                        const [table, column] = fieldKey.split('|');
-                        addFilterGroup(table, column);
+                    const fields = Array.from(fieldsFound).map(fk => {
+                        const [table, column] = fk.split('|');
+                        return { TableName: table, ColumnName: column, DisplayName: column };
                     });
+
+                    const response = await fetch('/Report/SaveBulkFilters', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            ReportId: parseInt(localReportId),
+                            Filters: fields
+                        })
+                    });
+
+                    if (response.ok) {
+                        alert(`Success! Discovered and saved ${fields.length} field(s).`);
+                        await loadFilters();
+                    } else {
+                        throw new Error("Failed to save discovered fields.");
+                    }
                 }
             } catch (err) {
                 console.error("Scan error:", err);
@@ -560,25 +712,6 @@
             }
         }
 
-        function addFilterGroup(table, column) {
-            // Check if already exists
-            if ($(`.filter-group[data-table="${table}"][data-column="${column}"]`).length > 0) return;
-
-            const area = $('#manualFilterArea');
-            const group = $(`
-                <div class="filter-group" data-table="${table}" data-column="${column}">
-                    <div class="filter-group-header" onclick="$(this).next().slideToggle()">
-                        <span>${column}</span>
-                        <i class="bi bi-chevron-down small"></i>
-                    </div>
-                    <div class="filter-group-content">
-                        <div class="text-center p-2"><div class="spinner-border spinner-border-sm text-secondary"></div></div>
-                    </div>
-                </div>
-            `);
-            area.prepend(group);
-            loadColumnValues(table, column, group.find('.filter-group-content'));
-        }
 
         async function saveManualFilter() {
             const displayName = $('#manual_display_name').val();
@@ -586,44 +719,46 @@
             const columnName = $('#manual_column_name').val();
 
             if (!displayName || !columnName) {
-                alert("Please fill Display Name and Column Name.");
+                Toast.fire({ icon: 'warning', title: 'Please fill Display and Column names.' });
                 return;
             }
 
             const btn = $('#saveFilterBtn');
             const original = btn.html();
-            btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Applying...');
+            btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm me-2"></span>Validating...');
 
             try {
                 const response = await fetch('/Report/SaveCustomFilter', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        reportId: @Model.LocalReportId,
+                        reportId: parseInt(localReportId),
                         displayName: displayName,
                         tableName: tableName,
                         columnName: columnName
                     })
                 });
 
+                const data = await response.json();
+
                 if (response.ok) {
+                    Toast.fire({ icon: 'success', title: 'Filter added successfully!' });
                     bootstrap.Modal.getInstance(document.getElementById('manualFilterModal')).hide();
                     
-                    if ("@Model.ReportType" === "RDL") {
-                        const overlay = $('#loadingOverlay');
-                        overlay.find('.loading-text').text("Injecting filter into XML and syncing with Power BI... Please wait.");
-                        overlay.fadeIn();
-                        setTimeout(() => location.reload(), 5000); 
-                    } else {
-                        location.reload();
-                    }
+                    // Refresh the filter list and apply
+                    await loadFilters();
                 } else {
-                    const data = await response.json();
-                    alert(data.message || "Failed to save filter.");
+                    // This will show the "Field 'X' not found in RDL dataset" error
+                    Swal.fire({
+                        icon: 'error',
+                        title: 'Validation Failed',
+                        text: data.message || "Failed to save filter.",
+                        confirmButtonColor: '#0d6efd'
+                    });
                 }
             } catch (err) {
                 console.error("Save error:", err);
-                alert("An error occurred while saving the filter.");
+                Toast.fire({ icon: 'error', title: 'An error occurred while saving.' });
             } finally {
                 btn.prop('disabled', false).html(original);
             }
@@ -645,20 +780,59 @@
             try {
                 const response = await fetch(`/Report/ResetFilters?reportId=${localReportId}`, { method: 'POST' });
                 if (response.ok) {
-                    $('#filterArea').empty().append(`
-                        <div class="text-center py-5" id="filterLoader">
-                            <div class="spinner-border text-primary spinner-border-sm" role="status"></div>
-                            <p class="text-muted small mt-2">Refreshing parameters...</p>
-                        </div>
-                    `);
-                    await loadFilters();
+                    const data = await response.json();
+                    console.log("[SINGLE-REPORT] Sync result:", data);
+                    
+                    Toast.fire({ icon: 'success', title: 'Parameters synchronized.' });
+                    
+                    if (data.reportId && data.reportId !== pbiReportId) {
+                        console.log("[SINGLE-REPORT] Report ID changed. Reloading for fresh embed...");
+                        setTimeout(() => window.location.reload(), 1500);
+                        return;
+                    }
+
+                    const filterArea = $('#filterArea');
+                    filterArea.empty();
+                    
+                    if (data.filters && data.filters.length > 0) {
+                        availableFilters = data.filters;
+                        
+                        // Group and render
+                        const systemFilters = data.filters.filter(f => !f.isCustom);
+                        const customFilters = data.filters.filter(f => f.isCustom);
+
+                        if (systemFilters.length > 0) {
+                            filterArea.append('<div class="px-3 py-1 bg-light text-uppercase fw-bold text-muted border-bottom mb-2" style="font-size: 0.65rem; letter-spacing: 0.05rem;">Report Parameters</div>');
+                            systemFilters.forEach(f => addFilterGroup(f));
+                        }
+
+                        if (customFilters.length > 0) {
+                            filterArea.append('<div class="px-3 py-1 bg-light text-uppercase fw-bold text-muted border-bottom mt-3 mb-2" style="font-size: 0.65rem; letter-spacing: 0.05rem;">My Custom Filters</div>');
+                            customFilters.forEach(f => addFilterGroup(f));
+                        }
+                    } else {
+                        filterArea.html('<div class="p-3 text-muted small text-center">No parameters found.</div>');
+                    }
                 } else {
-                    alert("Discovery failed. Ensure the .rdl file exists in wwwroot/uploads/");
+                    Toast.fire({ icon: 'error', title: 'Sync failed. Check RDL file.' });
                 }
-            } catch (err) {
-                alert("An error occurred during discovery.");
             } finally {
                 btn.removeClass('fa-spin').prop('disabled', false);
+            }
+        }
+
+        async function deleteFilter(id, el) {
+            if (!confirm("Remove this filter from your view?")) return;
+            
+            try {
+                const response = await fetch(`/Report/DeleteFilter?filterId=${id}`, { method: 'POST' });
+                if (response.ok) {
+                    $(el).closest('.filter-group').fadeOut(function() { $(this).remove(); });
+                } else {
+                    alert("Failed to delete filter.");
+                }
+            } catch (err) {
+                alert("Error deleting filter.");
             }
         }
     </script>

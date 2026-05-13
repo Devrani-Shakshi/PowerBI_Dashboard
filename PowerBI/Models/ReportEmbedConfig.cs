@@ -10,6 +10,7 @@ namespace PowerBI.Models
         public string? ReportType { get; set; } 
         public int LocalReportId { get; set; }
         public string? WorkspaceId { get; set; }
+        public string? TenantId { get; set; }
         public System.Collections.Generic.Dictionary<string, string> Parameters { get; set; } = new();
     }
 }
