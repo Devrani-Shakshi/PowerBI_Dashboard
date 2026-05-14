@@ -287,9 +287,11 @@
                 }
             });
 
+            // Load filters immediately so they appear even if the report is slow to load
+            loadFilters();
+
             report.on("loaded", async () => {
                 console.log("[PREVIEW] Report Event: LOADED");
-                await loadFilters();
             });
 
             report.on("rendered", function () {
@@ -745,6 +747,15 @@
                     Toast.fire({ icon: 'success', title: 'Filter added successfully!' });
                     bootstrap.Modal.getInstance(document.getElementById('manualFilterModal')).hide();
                     
+                    // --- ID DRIFT FIX ---
+                    // If the report ID changed (common for RDL after injection), we MUST reload the page
+                    // to re-initialize the Power BI embed with the new valid ID.
+                    if (data.reportId && data.reportId !== pbiReportId) {
+                        console.log("[SINGLE-REPORT] ID drift detected after filter injection. Reloading...");
+                        setTimeout(() => window.location.reload(), 1000);
+                        return;
+                    }
+
                     // Refresh the filter list and apply
                     await loadFilters();
                 } else {

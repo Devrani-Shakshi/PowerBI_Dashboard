@@ -463,7 +463,7 @@ namespace PowerBI.Controllers
                 }
 
                 await _db.SaveChangesAsync();
-                return Ok(new { success = true, message = "Filter saved successfully." });
+                return Ok(new { success = true, message = "Filter saved successfully.", reportId = report.PowerBIReportId });
             }
             catch (Exception ex)
             {

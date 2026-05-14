@@ -624,47 +624,47 @@ namespace PowerBI.Services
                     string? defaultConn = _config.GetConnectionString("DefaultConnection");
                     if (!string.IsNullOrEmpty(defaultConn))
                     {
-                        Console.WriteLine(">>>> [RDL-UPLOAD] Scanning for DataSources to inject ConnectionString...");
                         var dataSources = xDoc.Descendants(ns + "DataSource");
                         foreach (var ds in dataSources)
                         {
-                            var connProps = ds.Element(ns + "ConnectionProperties");
-                            if (connProps != null)
+                            string dsName = ds.Attribute("Name")?.Value ?? "DataSource";
+
+                            // --- CONVERT SHARED TO EMBEDDED (Power BI Requirement) ---
+                            var dsRef = ds.Element(ns + "DataSourceReference");
+                            if (dsRef != null)
                             {
-                                // --- STATIC DATA PROTECTION ---
-                                // Check if any dataset using this datasource contains XML/Static data.
-                                // If it does, forcing 'SQL' provider will break the report.
-                                string dsName = ds.Attribute("Name")?.Value ?? "";
-                                bool hasStaticData = xDoc.Descendants(ns + "DataSet")
-                                    .Where(d => d.Element(ns + "Query")?.Element(ns + "DataSourceName")?.Value == dsName)
-                                    .Any(d => d.Element(ns + "Query")?.Element(ns + "CommandText")?.Value?.TrimStart().StartsWith("<Query", StringComparison.OrdinalIgnoreCase) == true);
-
-                                if (hasStaticData)
-                                {
-                                    Console.WriteLine($">>>> [RDL-UPLOAD] SKIP: DataSource '{dsName}' uses Static XML Data. Bypassing SQL Injection.");
-                                    continue;
-                                }
-
-                                var provider = connProps.Element(ns + "DataProvider");
-                                if (provider == null) 
-                                { 
-                                    provider = new XElement(ns + "DataProvider"); 
-                                    connProps.AddFirst(provider); 
-                                }
-                                
-                                // FORCE: Use 'SQL' (SQL Server) extension for local SQL connections.
-                                if (provider.Value != "SQL")
-                                {
-                                    Console.WriteLine($">>>> [RDL-UPLOAD] Updating DataProvider for '{dsName}' from '{provider.Value}' to 'SQL'.");
-                                    provider.Value = "SQL";
-                                }
-
-                                var connectString = connProps.Element(ns + "ConnectString");
-                                if (connectString == null) { connectString = new XElement(ns + "ConnectString"); connProps.Add(connectString); }
-                                connectString.Value = defaultConn;
-                                
-                                Console.WriteLine($">>>> [RDL-UPLOAD] ConnectionString injected into DataSource '{dsName}'.");
+                                Console.WriteLine($">>>> [RDL-UPLOAD] Converting Shared DataSource '{dsName}' to Embedded.");
+                                dsRef.Remove();
                             }
+
+                            var connProps = ds.Element(ns + "ConnectionProperties");
+                            if (connProps == null)
+                            {
+                                Console.WriteLine($">>>> [RDL-UPLOAD] Creating Embedded ConnectionProperties for '{dsName}'.");
+                                connProps = new XElement(ns + "ConnectionProperties");
+                                ds.Add(connProps);
+                            }
+
+                            // --- STATIC DATA PROTECTION ---
+                            bool hasStaticData = xDoc.Descendants(ns + "DataSet")
+                                .Where(d => d.Element(ns + "Query")?.Element(ns + "DataSourceName")?.Value == dsName)
+                                .Any(d => d.Element(ns + "Query")?.Element(ns + "CommandText")?.Value?.TrimStart().StartsWith("<Query", StringComparison.OrdinalIgnoreCase) == true);
+
+                            if (hasStaticData)
+                            {
+                                Console.WriteLine($">>>> [RDL-UPLOAD] SKIP: DataSource '{dsName}' uses Static XML Data.");
+                                continue;
+                            }
+
+                            var provider = connProps.Element(ns + "DataProvider");
+                            if (provider == null) { provider = new XElement(ns + "DataProvider", "SQL"); connProps.AddFirst(provider); }
+                            else { provider.Value = "SQL"; }
+
+                            var connectString = connProps.Element(ns + "ConnectString");
+                            if (connectString == null) { connectString = new XElement(ns + "ConnectString"); connProps.Add(connectString); }
+                            connectString.Value = defaultConn;
+                            
+                            Console.WriteLine($">>>> [RDL-UPLOAD] Connection successfully injected for '{dsName}'.");
                         }
                     }
 
@@ -1081,7 +1081,7 @@ namespace PowerBI.Services
             Console.WriteLine($"[SCHEMA-DISCOVERY] Report Name: {report.Name}");
 
             var existingFilters = db.ReportFilters
-                .Where(f => f.ReportId == reportId && f.UserId == userId)
+                .Where(f => f.ReportId == reportId && (f.UserId == null || f.UserId == userId))
                 .ToList();
 
             var processedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1098,15 +1098,16 @@ namespace PowerBI.Services
                     var url = $"https://api.powerbi.com/v1.0/myorg/groups/{workspace.PowerBIWorkspaceId}/reports/{report.PowerBIReportId}/parameters";
 
                     var response = await httpClient.GetAsync(url);
+                    bool apiDiscoveryFailed = true;
                     if (response.IsSuccessStatusCode)
                     {
-                        Console.WriteLine($">>>> [FLOW] RDL: API discovery successful.");
                         var rawJson = await response.Content.ReadAsStringAsync();
                         var root = Newtonsoft.Json.Linq.JObject.Parse(rawJson);
                         var parameters = root["value"] as Newtonsoft.Json.Linq.JArray;
 
-                        if (parameters != null)
+                        if (parameters != null && parameters.Count > 0)
                         {
+                            Console.WriteLine($">>>> [FLOW] RDL: API discovery successful. Found {parameters.Count} parameters.");
                             foreach (var param in parameters)
                             {
                                 string? paramName = param["name"]?.ToString();
@@ -1134,12 +1135,14 @@ namespace PowerBI.Services
                                 }
                                 processedKeys.Add($"RDL_PARAMETER|{paramName}");
                                 count++;
+                                apiDiscoveryFailed = false;
                             }
                         }
                     }
-                    else
+                    
+                    if (apiDiscoveryFailed)
                     {
-                        Console.WriteLine($">>>> [FLOW] RDL: API returned {response.StatusCode}. Falling back to Local Parsing...");
+                        Console.WriteLine($">>>> [FLOW] RDL: API was empty or failed (Status: {response.StatusCode}). Falling back to Local Parsing...");
                         string? rdlXml = report.RdlContent;
                         XDocument xDoc;
 
@@ -1163,6 +1166,14 @@ namespace PowerBI.Services
                         {
                             string? paramName = p.Attribute("Name")?.Value;
                             if (string.IsNullOrEmpty(paramName)) continue;
+
+                            // Skip technical/hidden parameters that shouldn't be seen by users
+                            bool isHidden = p.Element(ns + "Hidden")?.Value.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
+                            if (isHidden)
+                            {
+                                Console.WriteLine($">>>> [FLOW] RDL: Skipping Hidden Technical Parameter: {paramName}");
+                                continue;
+                            }
                             
                             var existing = existingFilters.FirstOrDefault(f => f.TableName == "RDL_PARAMETER" && f.ColumnName == paramName);
                             if (existing == null)
@@ -1170,6 +1181,12 @@ namespace PowerBI.Services
                                 existing = new ReportFilter { ReportId = reportId, TableName = "RDL_PARAMETER", ColumnName = paramName, DisplayName = paramName, IsActive = true, UserId = userId, IsCustom = false };
                                 db.ReportFilters.Add(existing);
                             }
+                            else if (!existing.IsCustom)
+                            {
+                                existing.IsActive = true;
+                            }
+                            
+                            Console.WriteLine($">>>> [FLOW] RDL: Identified Parameter (Local): {paramName}");
                             processedKeys.Add($"RDL_PARAMETER|{paramName}");
                             count++;
                         }
@@ -1185,6 +1202,8 @@ namespace PowerBI.Services
                             {
                                 if (!processedKeys.Contains($"{m.TableName}|{m.ColumnName}"))
                                     processedKeys.Add($"{m.TableName}|{m.ColumnName}");
+                                
+                                count++; // CRITICAL: Custom filters count as discovered fields
                                 modified = true;
                             }
                         }
@@ -1239,7 +1258,10 @@ namespace PowerBI.Services
                     db.ReportFilters.Remove(f);
             }
 
-            if (count == 0) throw new Exception("No queryable fields or parameters discovered.");
+            if (count == 0)
+            {
+                Console.WriteLine(">>>> [FLOW] No public filters discovered. Continuing anyway...");
+            }
             await db.SaveChangesAsync();
             return modified;
         }
@@ -1787,7 +1809,7 @@ namespace PowerBI.Services
                                 new XElement(ns + "FilterExpression", $"={fieldRef}"),
                                 new XElement(ns + "Operator", "Equal"),
                                 new XElement(ns + "FilterValues", new XElement(ns + "FilterValue", 
-                                    $"=IIf({paramRef} = \"\" OR {paramRef} IS NOTHING OR {paramRef} = \"ALL\", {fieldRef}, {paramRef})"))));
+                                    $"=IIf({paramRef} = \"\" OR IsNothing({paramRef}) OR {paramRef} = \"ALL\", {fieldRef}, {paramRef})"))));
                         }
                     }
                 }
@@ -1957,9 +1979,17 @@ namespace PowerBI.Services
                                 try { targetDb = (reportDs.ConnectionDetails?.Database ?? "___").Replace("\\\\", "\\"); } catch { }
                             }
 
-                            // CRITICAL FALLBACK: If we still have underscores, use our known local server
-                            if (targetServer == "___") targetServer = "zsdeskt8ibnl5\\sqlexpress";
-                            if (targetDb == "___") targetDb = "powerBIdemo";
+                            // CRITICAL FALLBACK: If we still have underscores, use the current connection string from config
+                            if (targetServer == "___" || targetDb == "___")
+                            {
+                                string? connStr = _config.GetConnectionString("DefaultConnection");
+                                if (!string.IsNullOrEmpty(connStr))
+                                {
+                                    var builder = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(connStr);
+                                    if (targetServer == "___") targetServer = builder.DataSource ?? "___";
+                                    if (targetDb == "___") targetDb = builder.InitialCatalog ?? "___";
+                                }
+                            }
 
                             string gwConn = (gds.ConnectionDetails ?? "").Replace("\\\\", "\\");
                             
